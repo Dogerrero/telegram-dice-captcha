@@ -16,6 +16,7 @@ from constants import (
     MAX_ATTEMPTS,
     MESSAGE_DELETE_TIMEOUT,
 )
+from cleanup import schedule_message_deletion
 from utils import get_callback_user_info, get_dice_keyboard, set_permissions_to
 
 router = Router()
@@ -29,7 +30,7 @@ async def _kick_user(bot: Bot, chat_id: int, user_id: int) -> None:
     _attempts.pop(key, None)
     try:
         notice = await bot.send_message(chat_id, "Пользователь исключён: капча не пройдена за 2 попытки.")
-        asyncio.create_task(_delete_message_after_timeout(bot, chat_id, notice.message_id))
+        schedule_message_deletion(chat_id, notice.message_id, MESSAGE_DELETE_TIMEOUT)
     except Exception:
         logging.exception("Failed to announce captcha kick for user %s", user_id)
     try:
@@ -42,22 +43,15 @@ async def _kick_user(bot: Bot, chat_id: int, user_id: int) -> None:
 
 async def _send_challenge(bot: Bot, chat_id: int, user_id: int, attempt: int) -> None:
     dice = await bot.send_dice(chat_id, emoji="🎲")
-    asyncio.create_task(_delete_message_after_timeout(bot, chat_id, dice.message_id))
+    schedule_message_deletion(chat_id, dice.message_id, MESSAGE_DELETE_TIMEOUT)
     dice_value = dice.dice.value
     keyboard = get_dice_keyboard(dice_value=dice_value, user_id=user_id)
     message = await bot.send_message(chat_id, DICE_SEND_MSG, reply_markup=keyboard.as_markup())
+    schedule_message_deletion(chat_id, message.message_id, MESSAGE_DELETE_TIMEOUT)
     key = (chat_id, user_id)
     _attempts[key] = attempt
     _active_challenges[key] = message.message_id
     asyncio.create_task(_expire_challenge_after_timeout(bot, chat_id, user_id, message.message_id))
-
-
-async def _delete_message_after_timeout(bot: Bot, chat_id: int, message_id: int) -> None:
-    await asyncio.sleep(MESSAGE_DELETE_TIMEOUT)
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception:
-        logging.exception("Failed to delete expired message %s", message_id)
 
 
 async def _next_attempt_after_wrong(bot: Bot, chat_id: int, user_id: int, attempt: int) -> None:

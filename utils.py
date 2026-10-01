@@ -1,6 +1,7 @@
 from aiogram import Bot, types
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from constants import CORRECT_ANSWER_PREFIX, WRONG_ANSWER_PREFIX
+from cleanup import schedule_message_deletion
+from constants import CORRECT_ANSWER_PREFIX, WRONG_ANSWER_PREFIX, MESSAGE_DELETE_TIMEOUT
 
 
 def get_callback_user_info(callback: types.CallbackQuery, prefix: str):
@@ -45,4 +46,5 @@ def get_dice_keyboard(dice_value: int, user_id: int) -> InlineKeyboardBuilder:
 async def get_dice_value(chat_id: int, bot: Bot) -> int:
     """send dice to chat and return dice value"""
     data = await bot.send_dice(chat_id, emoji='🎲')
+    schedule_message_deletion(chat_id, data.message_id, MESSAGE_DELETE_TIMEOUT)
     return data.dice.value
