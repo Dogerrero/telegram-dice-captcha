@@ -14,8 +14,9 @@ from constants import (
     BAN_TIMEOUT,
     CAPTCHA_TIMEOUT,
     MAX_ATTEMPTS,
+    MESSAGE_DELETE_TIMEOUT,
 )
-from utils import get_callback_user_info, get_dice_keyboard, get_dice_value, set_permissions_to
+from utils import get_callback_user_info, get_dice_keyboard, set_permissions_to
 
 router = Router()
 _active_challenges = {}
@@ -27,7 +28,8 @@ async def _kick_user(bot: Bot, chat_id: int, user_id: int) -> None:
     _active_challenges.pop(key, None)
     _attempts.pop(key, None)
     try:
-        await bot.send_message(chat_id, "Пользователь исключён: капча не пройдена за 2 попытки.")
+        notice = await bot.send_message(chat_id, "Пользователь исключён: капча не пройдена за 2 попытки.")
+        asyncio.create_task(_delete_message_after_timeout(bot, chat_id, notice.message_id))
     except Exception:
         logging.exception("Failed to announce captcha kick for user %s", user_id)
     try:
@@ -39,13 +41,23 @@ async def _kick_user(bot: Bot, chat_id: int, user_id: int) -> None:
 
 
 async def _send_challenge(bot: Bot, chat_id: int, user_id: int, attempt: int) -> None:
-    dice_value = await get_dice_value(chat_id=chat_id, bot=bot)
+    dice = await bot.send_dice(chat_id, emoji="🎲")
+    asyncio.create_task(_delete_message_after_timeout(bot, chat_id, dice.message_id))
+    dice_value = dice.dice.value
     keyboard = get_dice_keyboard(dice_value=dice_value, user_id=user_id)
     message = await bot.send_message(chat_id, DICE_SEND_MSG, reply_markup=keyboard.as_markup())
     key = (chat_id, user_id)
     _attempts[key] = attempt
     _active_challenges[key] = message.message_id
-    asyncio.create_task(_delete_challenge_after_timeout(bot, chat_id, user_id, message.message_id))
+    asyncio.create_task(_expire_challenge_after_timeout(bot, chat_id, user_id, message.message_id))
+
+
+async def _delete_message_after_timeout(bot: Bot, chat_id: int, message_id: int) -> None:
+    await asyncio.sleep(MESSAGE_DELETE_TIMEOUT)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        logging.exception("Failed to delete expired message %s", message_id)
 
 
 async def _next_attempt_after_wrong(bot: Bot, chat_id: int, user_id: int, attempt: int) -> None:
@@ -58,16 +70,16 @@ async def _next_attempt_after_wrong(bot: Bot, chat_id: int, user_id: int, attemp
         logging.exception("Failed to resend captcha for user %s in chat %s", user_id, chat_id)
 
 
-async def _delete_challenge_after_timeout(bot: Bot, chat_id: int, user_id: int, message_id: int) -> None:
+async def _expire_challenge_after_timeout(bot: Bot, chat_id: int, user_id: int, message_id: int) -> None:
     await asyncio.sleep(CAPTCHA_TIMEOUT)
     key = (chat_id, user_id)
     if _active_challenges.get(key) != message_id:
         return
     _active_challenges.pop(key, None)
     try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
     except Exception:
-        logging.exception("Failed to delete expired captcha message %s", message_id)
+        logging.exception("Failed to deactivate expired captcha message %s", message_id)
 
     attempt = _attempts.get(key, 1)
     if attempt >= MAX_ATTEMPTS:
@@ -105,7 +117,7 @@ async def correct_answer_handler(callback: types.CallbackQuery, bot: Bot):
         _attempts.pop((chat_id, user_id), None)
         await set_permissions_to(user_id=user_id, chat_id=chat_id, permissions=True, bot=bot)
         await callback.answer(CORRECT_ANSWER_MSG)
-        await callback.message.delete()
+        await callback.message.edit_reply_markup(reply_markup=None)
 
 
 @router.callback_query(F.data.startswith(WRONG_ANSWER_PREFIX))
@@ -123,7 +135,7 @@ async def wrong_answer_handler(callback: types.CallbackQuery, bot: Bot):
         key = (chat_id, user_id)
         attempt = _attempts.get(key, 1)
         _active_challenges.pop(key, None)
-        await callback.message.delete()
+        await callback.message.edit_reply_markup(reply_markup=None)
         if attempt >= MAX_ATTEMPTS:
             await _kick_user(bot, chat_id, user_id)
         else:

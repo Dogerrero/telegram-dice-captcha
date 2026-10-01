@@ -2,6 +2,7 @@ WRONG_ANSWER_PREFIX = "wrong_answer_from_"
 CORRECT_ANSWER_PREFIX = "correct_answer_from_"
 BAN_TIMEOUT = 30
 CAPTCHA_TIMEOUT = 120
+MESSAGE_DELETE_TIMEOUT = 300
 # texts
 DICE_SEND_MSG = 'Сколько выпало?'
 CORRECT_ANSWER_MSG = 'Добро пожаловать'
