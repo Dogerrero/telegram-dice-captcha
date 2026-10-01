@@ -1,0 +1,36 @@
+[Unit]
+Description=Telegram Dice Captcha Bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=telegram-captcha
+Group=telegram-captcha
+WorkingDirectory=/opt/telegram-dice-captcha
+EnvironmentFile=/etc/telegram-dice-captcha.env
+Environment=ENVIRONMENT=production
+ExecStart=/opt/telegram-dice-captcha/venv/bin/python /opt/telegram-dice-captcha/main.py
+Restart=on-failure
+RestartSec=5
+
+StateDirectory=telegram-dice-captcha
+StateDirectoryMode=0750
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+MemoryDenyWriteExecute=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
