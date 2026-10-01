@@ -3,7 +3,7 @@ import logging
 from typing import Awaitable, Callable, TypeVar
 
 from aiogram import Bot, types
-from aiogram.exceptions import TelegramError, TelegramRetryAfter
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from constants import CORRECT_ANSWER_PREFIX, WRONG_ANSWER_PREFIX
@@ -26,7 +26,7 @@ async def telegram_call(
                 if attempt >= retries:
                     raise
                 await asyncio.sleep(min(exc.retry_after, 60))
-            except TelegramError:
+            except TelegramAPIError:
                 if attempt >= retries:
                     raise
                 await asyncio.sleep(min(2 ** attempt, 8))

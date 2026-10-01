@@ -1,8 +1,9 @@
 import asyncio
 import logging
+from html import escape
 
 from aiogram import F, Bot, Router, types
-from aiogram.exceptions import TelegramError
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import IS_MEMBER, IS_NOT_MEMBER, ChatMemberUpdatedFilter
 from aiogram.types import ChatMemberUpdated
 
@@ -60,7 +61,7 @@ async def _kick_user(bot: Bot, chat_id: int, user_id: int) -> None:
             notice.message_id,
             MESSAGE_DELETE_TIMEOUT,
         )
-    except TelegramError:
+    except TelegramAPIError:
         logging.exception(
             "Failed to announce captcha kick for user %s in chat %s",
             user_id,
@@ -81,7 +82,7 @@ async def _kick_user(bot: Bot, chat_id: int, user_id: int) -> None:
                 only_if_banned=True,
             )
         )
-    except TelegramError:
+    except TelegramAPIError:
         logging.exception(
             "Failed to remove user %s from chat %s",
             user_id,
@@ -109,6 +110,24 @@ async def _send_challenge(
     begin_challenge(chat_id, user_id, attempt)
 
     try:
+        display_name = "Пользователь"
+        try:
+            member = await telegram_call(
+                lambda: bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+            )
+            display_name = escape(
+                " ".join(
+                    part for part in (member.user.first_name, member.user.last_name)
+                    if part
+                )
+            ) or display_name
+        except TelegramAPIError:
+            logging.exception(
+                "Could not fetch display name for captcha user %s in chat %s",
+                user_id,
+                chat_id,
+            )
+
         dice = await telegram_call(
             lambda: bot.send_dice(chat_id, emoji="🎲")
         )
@@ -125,7 +144,8 @@ async def _send_challenge(
         message = await telegram_call(
             lambda: bot.send_message(
                 chat_id,
-                DICE_SEND_MSG,
+                f'<a href="tg://user?id={user_id}">{display_name}</a>, {DICE_SEND_MSG}',
+                parse_mode="HTML",
                 reply_markup=keyboard.as_markup(),
             )
         )
@@ -142,7 +162,7 @@ async def _send_challenge(
             attempt,
             CAPTCHA_TIMEOUT,
         )
-    except TelegramError:
+    except TelegramAPIError:
         delete(chat_id, user_id)
         raise
 
@@ -164,7 +184,7 @@ async def _process_expired(
                 reply_markup=None,
             )
         )
-    except TelegramError:
+    except TelegramAPIError:
         logging.exception(
             "Failed to deactivate expired captcha message %s",
             message_id,
@@ -207,7 +227,7 @@ async def _process_waiting(
             user_id,
             attempt,
         )
-    except TelegramError:
+    except TelegramAPIError:
         logging.exception(
             "Failed to continue captcha for user %s in chat %s",
             user_id,
@@ -285,7 +305,7 @@ async def new_member_handler(event: ChatMemberUpdated, bot: Bot):
             user_id,
             attempt=1,
         )
-    except TelegramError:
+    except TelegramAPIError:
         logging.exception(
             "Failed to initialize captcha for user %s in chat %s",
             user_id,
@@ -342,7 +362,7 @@ async def correct_answer_handler(
             )
         )
         delete(chat_id, user_id)
-    except TelegramError:
+    except TelegramAPIError:
         # Give the user another chance if Telegram failed transiently.
         reactivate(chat_id, user_id, CAPTCHA_TIMEOUT)
         logging.exception(
@@ -355,7 +375,7 @@ async def correct_answer_handler(
                 "Не удалось подтвердить капчу. Попробуйте ещё раз.",
                 show_alert=True,
             )
-        except TelegramError:
+        except TelegramAPIError:
             pass
 
 
@@ -414,7 +434,7 @@ async def wrong_answer_handler(
                 attempt + 1,
                 BAN_TIMEOUT,
             )
-    except TelegramError:
+    except TelegramAPIError:
         reactivate(chat_id, user_id, CAPTCHA_TIMEOUT)
         logging.exception(
             "Failed to process wrong captcha answer for user %s in chat %s",
@@ -426,7 +446,7 @@ async def wrong_answer_handler(
                 "Не удалось обработать ответ. Попробуйте ещё раз.",
                 show_alert=True,
             )
-        except TelegramError:
+        except TelegramAPIError:
             pass
 
 
