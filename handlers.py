@@ -48,7 +48,6 @@ from settings_store import clear_greeting, get_greeting, set_greeting
 from utils import (
     apply_captcha_restriction,
     get_dice_keyboard,
-    permissions_snapshot_for_restricted_member,
     telegram_call,
 )
 
@@ -234,7 +233,6 @@ async def _process_waiting(bot: Bot, challenge: dict) -> None:
             chat_id,
             user_id,
             restrict=True,
-            original_permissions=challenge.get("original_permissions"),
         )
         await _send_challenge(bot, chat_id, user_id, attempt)
     except Exception:
@@ -268,13 +266,12 @@ async def _process_passed(bot: Bot, challenge: dict) -> None:
             chat_id,
             user_id,
             restrict=False,
-            original_permissions=challenge.get("original_permissions"),
         )
         await _remove_keyboard(bot, chat_id, message_id)
         delete(chat_id, user_id)
     except Exception:
         logging.exception(
-            "Failed to restore permissions for user %s in chat %s; retrying",
+            "Failed to apply verified-member permissions for user %s in chat %s; retrying",
             user_id,
             chat_id,
         )
@@ -411,7 +408,6 @@ async def new_member_handler(event: ChatMemberUpdated, bot: Bot):
         # Duplicate/replayed join updates must not reset a live challenge.
         return
 
-    original_permissions = None
     try:
         current_member = await telegram_call(
             lambda: bot.get_chat_member(chat_id=chat_id, user_id=user_id)
@@ -425,13 +421,13 @@ async def new_member_handler(event: ChatMemberUpdated, bot: Bot):
                 current_status,
             )
             return
-        original_permissions = permissions_snapshot_for_restricted_member(current_member)
     except Exception:
         logging.exception(
-            "Could not inspect permissions before CAPTCHA chat=%s user=%s",
+            "Could not inspect member before CAPTCHA chat=%s user=%s",
             chat_id,
             user_id,
         )
+        return
 
     delay = 0 if await allow_new_join(chat_id) else BAN_TIMEOUT
     if not queue_challenge(
@@ -439,12 +435,11 @@ async def new_member_handler(event: ChatMemberUpdated, bot: Bot):
         user_id,
         attempt=1,
         delay_seconds=delay,
-        original_permissions=original_permissions,
     ):
         return
 
     # Lock immediately. If Telegram rejects this due to missing rights/network
-    # issues, the persisted queue will retry it instead of deleting the state.
+    # issues, the in-memory queue will retry it while the process is running.
     try:
         await _ensure_bot_can_restrict(bot, chat_id)
         await apply_captcha_restriction(
@@ -452,7 +447,6 @@ async def new_member_handler(event: ChatMemberUpdated, bot: Bot):
             chat_id,
             user_id,
             restrict=True,
-            original_permissions=None,
         )
     except Exception:
         logging.exception(
@@ -463,7 +457,7 @@ async def new_member_handler(event: ChatMemberUpdated, bot: Bot):
         retry_state(chat_id, user_id, "queued", API_RETRY_DELAY)
         return
 
-    # Release the durable row to the worker only after restrictions succeed.
+    # Release the queued state to the worker only after restrictions succeed.
     set_state(
         chat_id,
         user_id,

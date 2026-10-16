@@ -4,7 +4,6 @@ No user or challenge data is written to disk. State only exists while this
 process is running; the JSON settings file stores administrator text only.
 """
 
-import json
 import time
 from copy import deepcopy
 from typing import Optional
@@ -53,17 +52,12 @@ def queue_challenge(
     user_id: int,
     attempt: int = 1,
     delay_seconds: int = 0,
-    original_permissions: Optional[dict] = None,
 ) -> bool:
     """Start a transient flow for a new join; ignore duplicate join events."""
     key = _key(chat_id, user_id)
     if key in _challenges:
         return False
     now = time.time()
-    serialized_permissions = (
-        json.dumps(original_permissions, separators=(",", ":"))
-        if original_permissions is not None else None
-    )
     _challenges[key] = {
         "chat_id": int(chat_id),
         "user_id": int(user_id),
@@ -76,7 +70,6 @@ def queue_challenge(
         "next_action_at": now + max(0, delay_seconds),
         "expected_value": None,
         "challenge_token": None,
-        "original_permissions": serialized_permissions,
         "notice_sent": False,
         "kick_ban_issued": False,
     }
