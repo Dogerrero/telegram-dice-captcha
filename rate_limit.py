@@ -1,16 +1,18 @@
+"""In-memory join burst detector; callers queue joins instead of kicking them."""
 import asyncio
+import os
 import time
 from collections import defaultdict, deque
 
-MAX_ACTIVE_CAPTCHAS_PER_CHAT = 50
-JOIN_WINDOW_SECONDS = 60
-MAX_JOINS_PER_CHAT_WINDOW = 30
+JOIN_WINDOW_SECONDS = int(os.getenv("JOIN_WINDOW_SECONDS", "60"))
+MAX_JOINS_PER_CHAT_WINDOW = int(os.getenv("MAX_JOINS_PER_CHAT_WINDOW", "30"))
 
 _join_events = defaultdict(deque)
 _join_lock = asyncio.Lock()
 
 
 async def allow_new_join(chat_id: int) -> bool:
+    """Return False during bursts so CAPTCHA delivery can be delayed safely."""
     now = time.monotonic()
     async with _join_lock:
         events = _join_events[chat_id]
@@ -18,9 +20,7 @@ async def allow_new_join(chat_id: int) -> bool:
         while events and events[0] < cutoff:
             events.popleft()
 
-        if len(events) >= MAX_JOINS_PER_CHAT_WINDOW:
-            return False
-
+        allowed = len(events) < MAX_JOINS_PER_CHAT_WINDOW
         events.append(now)
 
         # Prevent unbounded growth for inactive chats.
@@ -32,4 +32,4 @@ async def allow_new_join(chat_id: int) -> bool:
             for key in stale:
                 _join_events.pop(key, None)
 
-        return True
+        return allowed

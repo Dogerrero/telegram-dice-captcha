@@ -1,181 +1,95 @@
 import asyncio
 import logging
+import time
 from html import escape
 
 from aiogram import F, Bot, Router, types
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import IS_MEMBER, IS_NOT_MEMBER, ChatMemberUpdatedFilter
+from aiogram.filters import IS_MEMBER, IS_NOT_MEMBER, ChatMemberUpdatedFilter, Command
 from aiogram.types import ChatMemberUpdated
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from constants import (
-    CORRECT_ANSWER_PREFIX,
-    WRONG_ANSWER_PREFIX,
-    DICE_SEND_MSG,
-    CORRECT_ANSWER_MSG,
-    WRONG_USER_MSG,
-    WRONG_ANSWER_MSG,
+    API_RETRY_DELAY,
     BAN_TIMEOUT,
     CAPTCHA_TIMEOUT,
+    CORRECT_ANSWER_MSG,
+    DICE_SEND_MSG,
+    MAX_ACTIVE_CAPTCHAS_PER_CHAT,
     MAX_ATTEMPTS,
     MESSAGE_DELETE_TIMEOUT,
+    WRONG_ANSWER_MSG,
+    WRONG_USER_MSG,
+    allowed_chat_ids,
 )
 from cleanup import schedule_message_deletion
+from captcha_payload import new_challenge_token, parse_captcha_callback
 from captcha_state import (
-    active_count,
     activate_challenge,
-    begin_challenge,
-    claim_active,
-    claim_expired,
+    active_count,
+    resolve_active_answer,
+    claim_due_pending,
     claim_due_waiting,
+    claim_pending_for,
     delete,
+    due_expired,
     get,
-    init_db,
+    mark_notice_sent,
+    mark_kick_ban_issued,
     mark_waiting,
-    reset_processing,
-    reactivate,
+    queue_challenge,
+    recover_stale_states,
+    retry_state,
     set_state,
+    start_sending,
 )
-from rate_limit import MAX_ACTIVE_CAPTCHAS_PER_CHAT, allow_new_join
+from rate_limit import allow_new_join
+from settings_store import clear_greeting, get_greeting, set_greeting
 from utils import (
-    get_callback_user_info,
+    apply_captcha_restriction,
     get_dice_keyboard,
-    set_permissions_to,
+    permissions_snapshot_for_restricted_member,
     telegram_call,
 )
 
 router = Router()
+_pending_greeting_edits: dict[tuple[int, int], int] = {}
 
 
-async def _kick_user(bot: Bot, chat_id: int, user_id: int) -> None:
-    delete(chat_id, user_id)
+def _chat_is_allowed(chat_id: int) -> bool:
+    ids = allowed_chat_ids()
+    if not ids:
+        logging.error(
+            "ALLOWED_CHAT_IDS is empty; refusing to process chat %s", chat_id
+        )
+        return False
+    if chat_id not in ids:
+        logging.warning("Ignoring event from non-allow-listed chat %s", chat_id)
+        return False
+    return True
 
-    try:
-        notice = await telegram_call(
-            lambda: bot.send_message(
-                chat_id,
-                "Пользователь исключён: капча не пройдена за 2 попытки.",
-            )
-        )
-        schedule_message_deletion(
-            chat_id,
-            notice.message_id,
-            MESSAGE_DELETE_TIMEOUT,
-        )
-    except TelegramAPIError:
-        logging.exception(
-            "Failed to announce captcha kick for user %s in chat %s",
-            user_id,
-            chat_id,
-        )
 
-    try:
-        await telegram_call(
-            lambda: bot.ban_chat_member(
-                chat_id=chat_id,
-                user_id=user_id,
-            )
-        )
-        await telegram_call(
-            lambda: bot.unban_chat_member(
-                chat_id=chat_id,
-                user_id=user_id,
-                only_if_banned=True,
-            )
-        )
-    except TelegramAPIError:
-        logging.exception(
-            "Failed to remove user %s from chat %s",
-            user_id,
-            chat_id,
+def _status(member) -> str:
+    status = getattr(member, "status", None)
+    return getattr(status, "value", status) or ""
+
+
+async def _ensure_bot_can_restrict(bot: Bot, chat_id: int) -> None:
+    """Fail loudly and retry later if Telegram admin rights are misconfigured."""
+    bot_member = await telegram_call(
+        lambda: bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
+    )
+    if _status(bot_member) != "administrator" or not bool(
+        getattr(bot_member, "can_restrict_members", False)
+    ):
+        raise RuntimeError(
+            f"Bot must be an administrator with Restrict members permission in chat {chat_id}"
         )
 
 
-async def _send_challenge(
-    bot: Bot,
-    chat_id: int,
-    user_id: int,
-    attempt: int,
-) -> None:
-    if active_count(chat_id) >= MAX_ACTIVE_CAPTCHAS_PER_CHAT:
-        logging.warning(
-            "Captcha capacity reached chat=%s user=%s",
-            chat_id,
-            user_id,
-        )
-        await _kick_user(bot, chat_id, user_id)
+async def _remove_keyboard(bot: Bot, chat_id: int, message_id: int) -> None:
+    if not message_id:
         return
-
-    # Create a persistent 'sending' state before the first API call. This
-    # prevents a callback from being accepted before the message ID is bound.
-    begin_challenge(chat_id, user_id, attempt)
-
-    try:
-        display_name = "Пользователь"
-        try:
-            member = await telegram_call(
-                lambda: bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-            )
-            display_name = escape(
-                " ".join(
-                    part for part in (member.user.first_name, member.user.last_name)
-                    if part
-                )
-            ) or display_name
-        except TelegramAPIError:
-            logging.exception(
-                "Could not fetch display name for captcha user %s in chat %s",
-                user_id,
-                chat_id,
-            )
-
-        dice = await telegram_call(
-            lambda: bot.send_dice(chat_id, emoji="🎲")
-        )
-        schedule_message_deletion(
-            chat_id,
-            dice.message_id,
-            MESSAGE_DELETE_TIMEOUT,
-        )
-
-        keyboard = get_dice_keyboard(
-            dice_value=dice.dice.value,
-            user_id=user_id,
-        )
-        message = await telegram_call(
-            lambda: bot.send_message(
-                chat_id,
-                f'<a href="tg://user?id={user_id}">{display_name}</a>, {DICE_SEND_MSG}',
-                parse_mode="HTML",
-                reply_markup=keyboard.as_markup(),
-            )
-        )
-        schedule_message_deletion(
-            chat_id,
-            message.message_id,
-            MESSAGE_DELETE_TIMEOUT,
-        )
-
-        activate_challenge(
-            chat_id,
-            user_id,
-            message.message_id,
-            attempt,
-            CAPTCHA_TIMEOUT,
-        )
-    except TelegramAPIError:
-        delete(chat_id, user_id)
-        raise
-
-
-async def _process_expired(
-    bot: Bot,
-    challenge: dict,
-) -> None:
-    chat_id = challenge["chat_id"]
-    user_id = challenge["user_id"]
-    message_id = challenge["message_id"]
-    attempt = challenge["attempt"]
-
     try:
         await telegram_call(
             lambda: bot.edit_message_reply_markup(
@@ -185,271 +99,628 @@ async def _process_expired(
             )
         )
     except TelegramAPIError:
-        logging.exception(
-            "Failed to deactivate expired captcha message %s",
+        # The database state already invalidates this challenge's callbacks.
+        logging.info(
+            "Could not remove keyboard chat=%s message=%s; stale callbacks are rejected",
+            chat_id,
             message_id,
         )
 
-    if attempt >= MAX_ATTEMPTS:
-        await _kick_user(bot, chat_id, user_id)
+
+async def _send_challenge(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    attempt: int,
+) -> None:
+    # Queued users do not consume active slots; exclude this user's own dispatch.
+    if active_count(chat_id, exclude_user_id=user_id) >= MAX_ACTIVE_CAPTCHAS_PER_CHAT:
+        set_state(
+            chat_id,
+            user_id,
+            "queued",
+            next_action_at=time.time() + 5,
+        )
         return
 
-    mark_waiting(
-        chat_id,
-        user_id,
-        attempt + 1,
-        BAN_TIMEOUT,
-    )
+    display_name = "Пользователь"
+    try:
+        member = await telegram_call(
+            lambda: bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        )
+        display_name = escape(
+            " ".join(
+                part for part in (member.user.first_name, member.user.last_name) if part
+            )
+        ) or display_name
+    except TelegramAPIError:
+        logging.exception(
+            "Could not fetch display name for captcha user %s in chat %s",
+            user_id,
+            chat_id,
+        )
+
+    try:
+        dice = await telegram_call(lambda: bot.send_dice(chat_id, emoji="🎲"))
+        schedule_message_deletion(chat_id, dice.message_id, MESSAGE_DELETE_TIMEOUT)
+
+        token = new_challenge_token()
+        if not start_sending(
+            chat_id,
+            user_id,
+            attempt,
+            dice.dice.value,
+            token,
+        ):
+            logging.warning(
+                "Challenge state changed before send chat=%s user=%s", chat_id, user_id
+            )
+            return
+
+        keyboard = get_dice_keyboard(challenge_token=token, user_id=user_id)
+        message = await telegram_call(
+            lambda: bot.send_message(
+                chat_id,
+                f'{escape(get_greeting(chat_id))}\n<a href="tg://user?id={user_id}">{display_name}</a>, {DICE_SEND_MSG}',
+                parse_mode="HTML",
+                reply_markup=keyboard.as_markup(),
+            )
+        )
+        schedule_message_deletion(chat_id, message.message_id, MESSAGE_DELETE_TIMEOUT)
+
+        if not activate_challenge(
+            chat_id,
+            user_id,
+            message.message_id,
+            attempt,
+            CAPTCHA_TIMEOUT,
+        ):
+            logging.error(
+                "Could not activate sent challenge chat=%s user=%s message=%s",
+                chat_id,
+                user_id,
+                message.message_id,
+            )
+    except Exception:
+        logging.exception(
+            "Failed to send captcha for user %s in chat %s; it will be retried",
+            user_id,
+            chat_id,
+        )
+        # Keep the row and retry it. Never lose a restricted newcomer because
+        # a Telegram API call or the process failed halfway through sending.
+        retry_state(chat_id, user_id, "queued", API_RETRY_DELAY)
 
 
-async def _process_waiting(
-    bot: Bot,
-    challenge: dict,
-) -> None:
+async def _process_expired(bot: Bot, challenge: dict) -> None:
+    chat_id = challenge["chat_id"]
+    user_id = challenge["user_id"]
+    attempt = challenge["attempt"]
+    message_id = challenge["message_id"]
+
+    # Persist the transition before external API calls, so a crash is recoverable.
+    if attempt >= MAX_ATTEMPTS:
+        set_state(chat_id, user_id, "kick_pending")
+    else:
+        # Timeout on the first challenge immediately starts the second one.
+        mark_waiting(chat_id, user_id, attempt + 1, 0)
+    await _remove_keyboard(bot, chat_id, message_id)
+
+
+async def _process_waiting(bot: Bot, challenge: dict) -> None:
     chat_id = challenge["chat_id"]
     user_id = challenge["user_id"]
     attempt = challenge["attempt"]
 
     try:
         member = await telegram_call(
-            lambda: bot.get_chat_member(
-                chat_id=chat_id,
-                user_id=user_id,
-            )
+            lambda: bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         )
-        if member.status.value in {"left", "kicked"}:
+        status = _status(member)
+        if status in {"left", "kicked"}:
+            delete(chat_id, user_id)
+            return
+        if status in {"administrator", "creator"}:
+            # Do not modify a user who was promoted while queued for a CAPTCHA.
+            logging.warning(
+                "Skipping CAPTCHA for administrator chat=%s user=%s", chat_id, user_id
+            )
             delete(chat_id, user_id)
             return
 
-        await _send_challenge(
+        await _ensure_bot_can_restrict(bot, chat_id)
+        await apply_captcha_restriction(
             bot,
             chat_id,
             user_id,
-            attempt,
+            restrict=True,
+            original_permissions=challenge.get("original_permissions"),
         )
-    except TelegramAPIError:
+        await _send_challenge(bot, chat_id, user_id, attempt)
+    except Exception:
         logging.exception(
-            "Failed to continue captcha for user %s in chat %s",
+            "Failed to continue captcha for user %s in chat %s; retrying",
             user_id,
             chat_id,
         )
-        # Keep the challenge persistent and retry later instead of losing it.
-        mark_waiting(
+        retry_state(chat_id, user_id, "queued", API_RETRY_DELAY)
+
+
+async def _process_passed(bot: Bot, challenge: dict) -> None:
+    chat_id = challenge["chat_id"]
+    user_id = challenge["user_id"]
+    message_id = challenge["message_id"]
+    try:
+        member = await telegram_call(
+            lambda: bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        )
+        status = _status(member)
+        if status in {"left", "kicked"}:
+            delete(chat_id, user_id)
+            return
+        if status in {"administrator", "creator"}:
+            # Do not touch rights of an administrator promoted during the check.
+            delete(chat_id, user_id)
+            return
+
+        await apply_captcha_restriction(
+            bot,
             chat_id,
             user_id,
-            attempt,
-            BAN_TIMEOUT,
+            restrict=False,
+            original_permissions=challenge.get("original_permissions"),
         )
+        await _remove_keyboard(bot, chat_id, message_id)
+        delete(chat_id, user_id)
+    except Exception:
+        logging.exception(
+            "Failed to restore permissions for user %s in chat %s; retrying",
+            user_id,
+            chat_id,
+        )
+        retry_state(chat_id, user_id, "passed_pending", API_RETRY_DELAY)
+
+
+async def _process_kick(bot: Bot, challenge: dict) -> None:
+    chat_id = challenge["chat_id"]
+    user_id = challenge["user_id"]
+
+    try:
+        if not challenge.get("notice_sent"):
+            try:
+                notice = await telegram_call(
+                    lambda: bot.send_message(
+                        chat_id,
+                        f"Пользователь <a href=\"tg://user?id={user_id}\">не прошёл капчу</a> и будет исключён.",
+                        parse_mode="HTML",
+                    )
+                )
+                schedule_message_deletion(
+                    chat_id, notice.message_id, MESSAGE_DELETE_TIMEOUT
+                )
+                mark_notice_sent(chat_id, user_id)
+            except TelegramAPIError:
+                # Announcements are non-critical; the moderation action proceeds.
+                logging.exception(
+                    "Could not announce CAPTCHA removal chat=%s user=%s", chat_id, user_id
+                )
+                mark_notice_sent(chat_id, user_id)
+
+        member = await telegram_call(
+            lambda: bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        )
+        status = _status(member)
+        if status == "left":
+            delete(chat_id, user_id)
+            return
+        if status in {"administrator", "creator"}:
+            logging.error(
+                "Refusing automatic removal of administrator chat=%s user=%s",
+                chat_id,
+                user_id,
+            )
+            delete(chat_id, user_id)
+            return
+        if status == "kicked":
+            if not challenge.get("kick_ban_issued"):
+                # A moderator had already banned this user. Don't undo that ban.
+                logging.warning(
+                    "User already banned outside this CAPTCHA; preserving ban "
+                    "chat=%s user=%s", chat_id, user_id
+                )
+                delete(chat_id, user_id)
+                return
+            # Recovery after our ban succeeded but unban did not complete.
+            await telegram_call(
+                lambda: bot.unban_chat_member(
+                    chat_id=chat_id, user_id=user_id, only_if_banned=True
+                )
+            )
+        else:
+            # Save intent before the external side effect for restart recovery.
+            mark_kick_ban_issued(chat_id, user_id)
+            await telegram_call(
+                lambda: bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+            )
+            await telegram_call(
+                lambda: bot.unban_chat_member(
+                    chat_id=chat_id, user_id=user_id, only_if_banned=True
+                )
+            )
+        delete(chat_id, user_id)
+    except Exception:
+        logging.exception(
+            "Failed to remove user %s from chat %s; removal will be retried",
+            user_id,
+            chat_id,
+        )
+        retry_state(chat_id, user_id, "kick_pending", API_RETRY_DELAY)
 
 
 async def captcha_state_worker(bot: Bot) -> None:
-    """Recover expirations and delayed retries, including after process restart."""
+    """Retry due work and recover in-flight states after an interrupted process."""
     while True:
         try:
-            for challenge in claim_due_waiting():
+            recover_stale_states()
+            allow_list = allowed_chat_ids()
+            for challenge in claim_due_waiting(allow_list):
                 await _process_waiting(bot, challenge)
-
-            for challenge in _claim_expired_batch():
+            for challenge in due_expired(allow_list):
                 await _process_expired(bot, challenge)
+            for challenge in claim_due_pending(allow_list):
+                if challenge["state"] == "passed_processing":
+                    await _process_passed(bot, challenge)
+                elif challenge["state"] == "kick_processing":
+                    await _process_kick(bot, challenge)
         except Exception:
             logging.exception("CAPTCHA state worker failed")
         await asyncio.sleep(5)
-
-
-def _claim_expired_batch():
-    # Kept as a small wrapper to make the worker easy to test.
-    from captcha_state import due_expired
-    return due_expired()
 
 
 @router.chat_member(ChatMemberUpdatedFilter(IS_MEMBER >> IS_NOT_MEMBER))
 async def member_left_handler(event: ChatMemberUpdated, bot: Bot):
     user_id = event.old_chat_member.user.id
     chat_id = event.chat.id
+    challenge = get(chat_id, user_id)
+    if challenge and challenge["state"] in {"kick_pending", "kick_processing"}:
+        # Keep the durable kick job; a member-left event may actually be the ban
+        # half of our ban/unban sequence after a previous process crash.
+        return
     delete(chat_id, user_id)
 
 
 @router.chat_member(ChatMemberUpdatedFilter(IS_NOT_MEMBER >> IS_MEMBER))
 async def new_member_handler(event: ChatMemberUpdated, bot: Bot):
-    user_id = event.new_chat_member.user.id
+    user = event.new_chat_member.user
+    user_id = user.id
     chat_id = event.chat.id
 
-    if not await allow_new_join(chat_id):
-        logging.warning(
-            "Join rate limit exceeded chat=%s user=%s; removing newcomer",
+    if not _chat_is_allowed(chat_id):
+        return
+    if event.chat.type != "supergroup":
+        logging.error(
+            "CAPTCHA only supports Telegram supergroups; ignoring chat=%s type=%s",
             chat_id,
-            user_id,
+            event.chat.type,
         )
-        await _kick_user(bot, chat_id, user_id)
+        return
+    if user.is_bot:
+        logging.info("Ignoring bot account joining chat=%s user=%s", chat_id, user_id)
+        return
+    if get(chat_id, user_id) is not None:
+        # Duplicate/replayed join updates must not reset a live challenge.
         return
 
-    if active_count(chat_id) >= MAX_ACTIVE_CAPTCHAS_PER_CHAT:
-        logging.warning(
-            "Captcha active limit exceeded chat=%s user=%s",
-            chat_id,
-            user_id,
-        )
-        await _kick_user(bot, chat_id, user_id)
-        return
-
+    original_permissions = None
     try:
-        await set_permissions_to(
-            user_id=user_id,
-            chat_id=chat_id,
-            permissions=False,
-            bot=bot,
+        current_member = await telegram_call(
+            lambda: bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         )
-        await _send_challenge(
+        current_status = _status(current_member)
+        if current_status in {"left", "kicked", "administrator", "creator"}:
+            logging.info(
+                "Skipping CAPTCHA because user is no longer an ordinary member chat=%s user=%s status=%s",
+                chat_id,
+                user_id,
+                current_status,
+            )
+            return
+        original_permissions = permissions_snapshot_for_restricted_member(current_member)
+    except Exception:
+        logging.exception(
+            "Could not inspect permissions before CAPTCHA chat=%s user=%s",
+            chat_id,
+            user_id,
+        )
+
+    delay = 0 if await allow_new_join(chat_id) else BAN_TIMEOUT
+    if not queue_challenge(
+        chat_id,
+        user_id,
+        attempt=1,
+        delay_seconds=delay,
+        original_permissions=original_permissions,
+    ):
+        return
+
+    # Lock immediately. If Telegram rejects this due to missing rights/network
+    # issues, the persisted queue will retry it instead of deleting the state.
+    try:
+        await _ensure_bot_can_restrict(bot, chat_id)
+        await apply_captcha_restriction(
             bot,
             chat_id,
             user_id,
-            attempt=1,
+            restrict=True,
+            original_permissions=None,
         )
-    except TelegramAPIError:
+    except Exception:
         logging.exception(
-            "Failed to initialize captcha for user %s in chat %s",
-            user_id,
+            "Could not restrict newcomer chat=%s user=%s; keeping durable retry",
             chat_id,
+            user_id,
         )
-        delete(chat_id, user_id)
-        await _kick_user(bot, chat_id, user_id)
-
-
-@router.callback_query(F.data.startswith(CORRECT_ANSWER_PREFIX))
-async def correct_answer_handler(
-    callback: types.CallbackQuery,
-    bot: Bot,
-):
-    user_id, is_target_user, chat_id = get_callback_user_info(
-        callback,
-        CORRECT_ANSWER_PREFIX,
-    )
-
-    if not is_target_user or user_id is None or chat_id is None:
-        await callback.answer(WRONG_USER_MSG, show_alert=True)
+        retry_state(chat_id, user_id, "queued", API_RETRY_DELAY)
         return
 
-    if callback.message is None:
-        await callback.answer("Некорректная капча.", show_alert=True)
-        return
-
-    # This is the security boundary: UPDATE ... WHERE state='active' makes
-    # duplicate/concurrent callbacks mutually exclusive.
-    claimed = claim_active(
+    # Release the durable row to the worker only after restrictions succeed.
+    set_state(
         chat_id,
         user_id,
-        callback.message.message_id,
+        "queued",
+        next_action_at=time.time() + max(0, delay),
     )
-    if claimed is None:
-        await callback.answer(
-            "Эта капча устарела. Дождитесь новой.",
-            show_alert=True,
+
+
+def _settings_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Изменить приветствие", callback_data="greet:edit")
+    builder.button(text="🔄 Сбросить приветствие", callback_data="greet:clear")
+    builder.button(text="👁 Показать текущее", callback_data="greet:show")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _settings_text(chat_id: int) -> str:
+    greeting = escape(get_greeting(chat_id))
+    return (
+        "<b>Настройки капчи</b>\n\n"
+        "Текст приветствия, который будет добавляться к каждой капче:\n"
+        f"<blockquote>{greeting}</blockquote>\n\n"
+        "Изменения сохраняются в JSON-файле настроек. Данные участников не сохраняются."
+    )
+
+
+async def _is_chat_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
+    try:
+        member = await telegram_call(
+            lambda: bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         )
+    except TelegramAPIError:
+        logging.exception("Could not verify admin status chat=%s user=%s", chat_id, user_id)
+        return False
+    return _status(member) in {"administrator", "creator"}
+
+
+@router.message(Command("captcha_settings"))
+async def captcha_settings_command(message: types.Message, bot: Bot):
+    chat_id = message.chat.id
+    user = message.from_user
+    if user is None or not _chat_is_allowed(chat_id):
+        return
+    if message.chat.type != "supergroup":
+        await message.answer("Настройки доступны только в супергруппе.")
+        return
+    if not await _is_chat_admin(bot, chat_id, user.id):
+        await message.reply("Настройки капчи доступны только администраторам группы.")
+        return
+
+    menu = await message.answer(
+        _settings_text(chat_id),
+        parse_mode="HTML",
+        reply_markup=_settings_keyboard(),
+    )
+    schedule_message_deletion(chat_id, menu.message_id, MESSAGE_DELETE_TIMEOUT)
+
+
+@router.callback_query(F.data.startswith("greet:"))
+async def greeting_settings_callback(callback: types.CallbackQuery, bot: Bot):
+    if callback.message is None:
+        await callback.answer("Не удалось определить группу.", show_alert=True)
+        return
+    chat_id = callback.message.chat.id
+    user_id = callback.from_user.id
+    if not _chat_is_allowed(chat_id):
+        await callback.answer("Бот не обслуживает эту группу.", show_alert=True)
+        return
+    if callback.message.chat.type != "supergroup":
+        await callback.answer("Настройки доступны только в супергруппе.", show_alert=True)
+        return
+    if not await _is_chat_admin(bot, chat_id, user_id):
+        await callback.answer("Настройки доступны только администраторам.", show_alert=True)
+        return
+
+    action = (callback.data or "").split(":", 1)[1]
+    if action == "edit":
+        _pending_greeting_edits[(chat_id, user_id)] = callback.message.message_id
+        prompt = await bot.send_message(
+            chat_id,
+            "Отправьте следующим сообщением новый текст приветствия (до 1000 символов).\n"
+            "Он будет добавляться перед вопросом капчи. Для отмены: /cancel_greeting",
+        )
+        schedule_message_deletion(chat_id, prompt.message_id, MESSAGE_DELETE_TIMEOUT)
+        await callback.answer("Жду новый текст приветствия.")
+        return
+
+    if action == "clear":
+        _pending_greeting_edits.pop((chat_id, user_id), None)
+        try:
+            clear_greeting(chat_id)
+        except OSError:
+            logging.exception("Could not reset greeting chat=%s", chat_id)
+            await callback.answer("Не удалось сохранить настройки. Проверьте права на файл.", show_alert=True)
+            return
+        await callback.answer("Установлен текст приветствия по умолчанию.")
+    elif action == "show":
+        await callback.answer("Текущее приветствие показано в меню.")
+    else:
+        await callback.answer("Неизвестное действие.", show_alert=True)
         return
 
     try:
-        await set_permissions_to(
-            user_id=user_id,
-            chat_id=chat_id,
-            permissions=True,
-            bot=bot,
+        await callback.message.edit_text(
+            _settings_text(chat_id),
+            parse_mode="HTML",
+            reply_markup=_settings_keyboard(),
         )
-        set_state(chat_id, user_id, "passed")
-        await callback.answer(CORRECT_ANSWER_MSG)
-        await telegram_call(
-            lambda: callback.message.edit_reply_markup(
-                reply_markup=None
-            )
-        )
-        delete(chat_id, user_id)
     except TelegramAPIError:
-        # Give the user another chance if Telegram failed transiently.
-        reactivate(chat_id, user_id, CAPTCHA_TIMEOUT)
-        logging.exception(
-            "Failed to verify user %s in chat %s",
-            user_id,
-            chat_id,
+        logging.info("Could not refresh greeting settings menu chat=%s", chat_id)
+
+
+@router.message(Command("cancel_greeting"))
+async def cancel_greeting_edit(message: types.Message):
+    user = message.from_user
+    if user is None:
+        return
+    key = (message.chat.id, user.id)
+    if key in _pending_greeting_edits:
+        _pending_greeting_edits.pop(key, None)
+        sent = await message.answer("Изменение приветствия отменено.")
+        schedule_message_deletion(message.chat.id, sent.message_id, MESSAGE_DELETE_TIMEOUT)
+
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def receive_greeting_text(message: types.Message, bot: Bot):
+    user = message.from_user
+    if user is None:
+        return
+    chat_id = message.chat.id
+    key = (chat_id, user.id)
+    if key not in _pending_greeting_edits:
+        return
+    menu_message_id = _pending_greeting_edits[key]
+    if not _chat_is_allowed(chat_id) or not await _is_chat_admin(bot, chat_id, user.id):
+        _pending_greeting_edits.pop(key, None)
+        return
+
+    greeting = (message.text or "").strip()
+    if not greeting:
+        await message.reply("Текст не должен быть пустым. Отправьте приветствие ещё раз.")
+        return
+    if len(greeting) > 1000:
+        await message.reply("Слишком длинный текст. Максимум — 1000 символов.")
+        return
+
+    try:
+        set_greeting(chat_id, greeting)
+    except (OSError, ValueError):
+        logging.exception("Could not save greeting chat=%s", chat_id)
+        await message.reply("Не удалось сохранить приветствие. Проверьте права на файл настроек.")
+        return
+
+    _pending_greeting_edits.pop(key, None)
+    # Refresh the menu if it still exists. It remains scheduled for deletion at
+    # the original five-minute deadline.
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=menu_message_id,
+            text=_settings_text(chat_id),
+            parse_mode="HTML",
+            reply_markup=_settings_keyboard(),
         )
+    except TelegramAPIError:
+        logging.info("Could not refresh greeting menu after save chat=%s", chat_id)
+
+    # The admin's message contains configuration text; remove it to avoid clutter.
+    try:
+        await telegram_call(
+            lambda: bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+        )
+    except TelegramAPIError:
+        logging.info("Could not delete administrator greeting input chat=%s", chat_id)
+
+    confirmation = await bot.send_message(chat_id, "Приветствие капчи сохранено.")
+    schedule_message_deletion(chat_id, confirmation.message_id, MESSAGE_DELETE_TIMEOUT)
+
+
+@router.callback_query(
+    F.data.startswith("correct_answer_from_") | F.data.startswith("wrong_answer_from_")
+)
+async def legacy_captcha_callback_handler(callback: types.CallbackQuery):
+    """Old buttons are invalidated on migration; give a clear response if clicked."""
+    await callback.answer(
+        "Эта капча устарела. Дождитесь нового сообщения от бота.",
+        show_alert=True,
+    )
+
+
+@router.callback_query(F.data.startswith("c:"))
+async def captcha_answer_handler(callback: types.CallbackQuery, bot: Bot):
+    parsed = parse_captcha_callback(callback.data)
+    if parsed is None or callback.message is None:
+        await callback.answer("Некорректная капча.", show_alert=True)
+        return
+
+    user_id, challenge_token, selected_number = parsed
+    if callback.from_user.id != user_id:
+        await callback.answer(WRONG_USER_MSG, show_alert=True)
+        return
+
+    chat_id = callback.message.chat.id
+    if not _chat_is_allowed(chat_id):
+        await callback.answer("Бот не обслуживает эту группу.", show_alert=True)
+        return
+
+    resolved = resolve_active_answer(
+        chat_id,
+        user_id,
+        callback.message.message_id,
+        challenge_token,
+        selected_number,
+        MAX_ATTEMPTS,
+        BAN_TIMEOUT,
+    )
+    if resolved is None:
         try:
             await callback.answer(
-                "Не удалось подтвердить капчу. Попробуйте ещё раз.",
+                "Эта капча устарела или уже обработана. Дождитесь новой.",
                 show_alert=True,
             )
         except TelegramAPIError:
             pass
-
-
-@router.callback_query(F.data.startswith(WRONG_ANSWER_PREFIX))
-async def wrong_answer_handler(
-    callback: types.CallbackQuery,
-    bot: Bot,
-):
-    user_id, is_target_user, chat_id = get_callback_user_info(
-        callback,
-        WRONG_ANSWER_PREFIX,
-    )
-
-    if not is_target_user or user_id is None or chat_id is None:
-        await callback.answer(WRONG_USER_MSG, show_alert=True)
         return
 
-    if callback.message is None:
-        await callback.answer("Некорректная капча.", show_alert=True)
+    state = resolved["state"]
+    if state == "passed_pending":
+        try:
+            await callback.answer(CORRECT_ANSWER_MSG)
+        except TelegramAPIError:
+            logging.info("Could not answer callback for passing user=%s", user_id)
+        pending = claim_pending_for(chat_id, user_id, "pass")
+        if pending:
+            await _process_passed(bot, pending)
         return
 
-    claimed = claim_active(
-        chat_id,
-        user_id,
-        callback.message.message_id,
-    )
-    if claimed is None:
-        await callback.answer(
-            "Эта капча устарела. Дождитесь новой.",
-            show_alert=True,
-        )
+    if state == "kick_pending":
+        try:
+            await callback.answer(
+                "Вторая попытка неверна. Вы будете исключены.", show_alert=True
+            )
+        except TelegramAPIError:
+            pass
+        pending = claim_pending_for(chat_id, user_id, "kick")
+        if pending:
+            await _process_kick(bot, pending)
         return
-
-    attempt = claimed["attempt"]
 
     try:
         await callback.answer(WRONG_ANSWER_MSG, show_alert=True)
-        await set_permissions_to(
-            user_id=user_id,
-            chat_id=chat_id,
-            permissions=False,
-            bot=bot,
-        )
-        await telegram_call(
-            lambda: callback.message.edit_reply_markup(
-                reply_markup=None
-            )
-        )
-
-        if attempt >= MAX_ATTEMPTS:
-            await _kick_user(bot, chat_id, user_id)
-        else:
-            mark_waiting(
-                chat_id,
-                user_id,
-                attempt + 1,
-                BAN_TIMEOUT,
-            )
     except TelegramAPIError:
-        reactivate(chat_id, user_id, CAPTCHA_TIMEOUT)
-        logging.exception(
-            "Failed to process wrong captcha answer for user %s in chat %s",
-            user_id,
-            chat_id,
-        )
-        try:
-            await callback.answer(
-                "Не удалось обработать ответ. Попробуйте ещё раз.",
-                show_alert=True,
-            )
-        except TelegramAPIError:
-            pass
+        logging.info("Could not answer wrong CAPTCHA callback user=%s", user_id)
+    await _remove_keyboard(bot, chat_id, callback.message.message_id)
 
 
 def initialize_state() -> None:
-    init_db()
-    reset_processing()
+    """No persistent CAPTCHA state is loaded; each process starts empty."""
+    return

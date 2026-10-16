@@ -1,86 +1,111 @@
-import sqlite3
+"""In-memory CAPTCHA state machine.
+
+No user or challenge data is written to disk. State only exists while this
+process is running; the JSON settings file stores administrator text only.
+"""
+
+import json
 import time
-from contextlib import contextmanager
-from pathlib import Path
-from typing import Iterator, Optional
+from copy import deepcopy
+from typing import Optional
 
-DB_PATH = Path("/var/lib/telegram-dice-captcha/pending_deletions.sqlite3")
+# Keyed by (chat_id, user_id); removed as soon as the flow completes or the
+# member leaves. This deliberately is not a persistent user registry.
+_challenges: dict[tuple[int, int], dict] = {}
 
-
-@contextmanager
-def connect() -> Iterator[sqlite3.Connection]:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(DB_PATH, timeout=10)
-    db.execute("PRAGMA busy_timeout=10000")
-    try:
-        yield db
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+_ACTIVE_STATES = {
+    "sending", "active", "processing", "dispatching", "timeout_processing"
+}
 
 
-def init_db() -> None:
-    with connect() as db:
-        db.execute(
-            """CREATE TABLE IF NOT EXISTS captcha_challenges (
-                chat_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                message_id INTEGER,
-                attempt INTEGER NOT NULL,
-                state TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL,
-                expires_at REAL NOT NULL,
-                next_action_at REAL,
-                PRIMARY KEY (chat_id, user_id)
-            )"""
-        )
-        # Migrate installations created by the previous hardening draft.
-        columns = {
-            row[1]
-            for row in db.execute("PRAGMA table_info(captcha_challenges)")
-        }
-        if "updated_at" not in columns:
-            db.execute(
-                "ALTER TABLE captcha_challenges ADD COLUMN updated_at REAL NOT NULL DEFAULT 0"
-            )
-            db.execute(
-                "UPDATE captcha_challenges SET updated_at = created_at WHERE updated_at = 0"
-            )
-        db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_captcha_due "
-            "ON captcha_challenges (state, next_action_at)"
-        )
+def _key(chat_id: int, user_id: int) -> tuple[int, int]:
+    return int(chat_id), int(user_id)
 
 
-def active_count(chat_id: int) -> int:
-    with connect() as db:
-        row = db.execute(
-            "SELECT COUNT(*) FROM captcha_challenges "
-            "WHERE chat_id = ? AND state IN "
-            "('sending', 'active', 'processing', 'waiting')",
-            (chat_id,),
-        ).fetchone()
-    return int(row[0])
+def _get_mutable(chat_id: int, user_id: int) -> Optional[dict]:
+    return _challenges.get(_key(chat_id, user_id))
 
 
-def begin_challenge(chat_id: int, user_id: int, attempt: int) -> None:
+def _snapshot(row: Optional[dict]) -> Optional[dict]:
+    return deepcopy(row) if row is not None else None
+
+
+
+def initialize_state() -> None:
+    """State starts empty on each process launch; no users are loaded from disk."""
+
+
+def active_count(chat_id: int, exclude_user_id: Optional[int] = None) -> int:
+    return sum(
+        1 for (row_chat, row_user), row in _challenges.items()
+        if row_chat == chat_id
+        and row_user != exclude_user_id
+        and row.get("state") in _ACTIVE_STATES
+    )
+
+
+def get(chat_id: int, user_id: int) -> Optional[dict]:
+    return _snapshot(_get_mutable(chat_id, user_id))
+
+
+def queue_challenge(
+    chat_id: int,
+    user_id: int,
+    attempt: int = 1,
+    delay_seconds: int = 0,
+    original_permissions: Optional[dict] = None,
+) -> bool:
+    """Start a transient flow for a new join; ignore duplicate join events."""
+    key = _key(chat_id, user_id)
+    if key in _challenges:
+        return False
     now = time.time()
-    with connect() as db:
-        db.execute(
-            """INSERT INTO captcha_challenges
-               (chat_id, user_id, message_id, attempt, state,
-                created_at, updated_at, expires_at, next_action_at)
-               VALUES (?, ?, 0, ?, 'sending', ?, ?, 0, NULL)
-               ON CONFLICT(chat_id, user_id) DO UPDATE SET
-                 message_id=0, attempt=excluded.attempt, state='sending',
-                 created_at=excluded.created_at, updated_at=excluded.updated_at,
-                 expires_at=0, next_action_at=NULL""",
-            (chat_id, user_id, attempt, now, now),
-        )
+    serialized_permissions = (
+        json.dumps(original_permissions, separators=(",", ":"))
+        if original_permissions is not None else None
+    )
+    _challenges[key] = {
+        "chat_id": int(chat_id),
+        "user_id": int(user_id),
+        "message_id": 0,
+        "attempt": int(attempt),
+        "state": "preparing",
+        "created_at": now,
+        "updated_at": now,
+        "expires_at": 0.0,
+        "next_action_at": now + max(0, delay_seconds),
+        "expected_value": None,
+        "challenge_token": None,
+        "original_permissions": serialized_permissions,
+        "notice_sent": False,
+        "kick_ban_issued": False,
+    }
+    return True
+
+
+def start_sending(
+    chat_id: int,
+    user_id: int,
+    attempt: int,
+    expected_value: int,
+    challenge_token: str,
+) -> bool:
+    row = _get_mutable(chat_id, user_id)
+    if row is None or row.get("state") not in {
+        "dispatching", "queued", "waiting"
+    }:
+        return False
+    row.update(
+        message_id=0,
+        attempt=int(attempt),
+        state="sending",
+        expected_value=int(expected_value),
+        challenge_token=challenge_token,
+        expires_at=0.0,
+        next_action_at=None,
+        updated_at=time.time(),
+    )
+    return True
 
 
 def activate_challenge(
@@ -89,170 +114,167 @@ def activate_challenge(
     message_id: int,
     attempt: int,
     timeout_seconds: int,
-) -> None:
+) -> bool:
+    row = _get_mutable(chat_id, user_id)
+    if row is None or row.get("state") != "sending":
+        return False
     now = time.time()
-    with connect() as db:
-        db.execute(
-            """UPDATE captcha_challenges
-               SET message_id = ?, attempt = ?, state = 'active',
-                   created_at = ?, updated_at = ?, expires_at = ?,
-                   next_action_at = NULL
-               WHERE chat_id = ? AND user_id = ? AND state = 'sending'""",
-            (
-                message_id,
-                attempt,
-                now,
-                now,
-                now + timeout_seconds,
-                chat_id,
-                user_id,
-            ),
-        )
+    row.update(
+        message_id=int(message_id),
+        attempt=int(attempt),
+        state="active",
+        created_at=now,
+        updated_at=now,
+        expires_at=now + max(0, timeout_seconds),
+        next_action_at=None,
+    )
+    return True
 
 
-def get(chat_id: int, user_id: int) -> Optional[dict]:
-    with connect() as db:
-        row = db.execute(
-            """SELECT chat_id, user_id, message_id, attempt, state,
-                      created_at, updated_at, expires_at, next_action_at
-               FROM captcha_challenges
-               WHERE chat_id = ? AND user_id = ?""",
-            (chat_id, user_id),
-        ).fetchone()
-    if row is None:
+def claim_active(
+    chat_id: int,
+    user_id: int,
+    message_id: int,
+    challenge_token: str,
+) -> Optional[dict]:
+    row = _get_mutable(chat_id, user_id)
+    now = time.time()
+    if not row or not (
+        row.get("state") == "active"
+        and row.get("message_id") == message_id
+        and row.get("challenge_token") == challenge_token
+        and row.get("expires_at", 0) > now
+    ):
         return None
-    keys = (
-        "chat_id", "user_id", "message_id", "attempt",
-        "state", "created_at", "updated_at", "expires_at",
-        "next_action_at",
+    row.update(state="processing", updated_at=now)
+    return _snapshot(row)
+
+
+def resolve_active_answer(
+    chat_id: int,
+    user_id: int,
+    message_id: int,
+    challenge_token: str,
+    selected_value: int,
+    max_attempts: int,
+    retry_delay_seconds: int,
+) -> Optional[dict]:
+    """Validate and consume an answer atomically within the event loop."""
+    row = _get_mutable(chat_id, user_id)
+    now = time.time()
+    if not row or not (
+        row.get("state") == "active"
+        and row.get("message_id") == message_id
+        and row.get("challenge_token") == challenge_token
+        and row.get("expires_at", 0) > now
+        and row.get("expected_value") is not None
+    ):
+        return None
+
+    expected_value = row["expected_value"]
+    attempt = row["attempt"]
+    if int(selected_value) == int(expected_value):
+        state = "passed_pending"
+        next_action_at = now
+    elif attempt >= max_attempts:
+        state = "kick_pending"
+        next_action_at = now
+    else:
+        state = "waiting"
+        row["attempt"] = attempt + 1
+        next_action_at = now + max(0, retry_delay_seconds)
+
+    row.update(
+        state=state,
+        updated_at=now,
+        next_action_at=next_action_at,
+        expected_value=None,
+        challenge_token=None,
+        expires_at=0.0,
     )
-    return dict(zip(keys, row))
+    return _snapshot(row)
 
 
-def claim_active(chat_id: int, user_id: int, message_id: int) -> Optional[dict]:
+def mark_kick_ban_issued(chat_id: int, user_id: int) -> None:
+    row = _get_mutable(chat_id, user_id)
+    if row:
+        row["kick_ban_issued"] = True
+        row["updated_at"] = time.time()
+
+
+def claim_due_waiting(allowed_chat_ids: Optional[set[int]] = None) -> list[dict]:
     now = time.time()
-    with connect() as db:
-        cursor = db.execute(
-            """UPDATE captcha_challenges
-               SET state = 'processing', updated_at = ?
-               WHERE chat_id = ? AND user_id = ?
-                 AND message_id = ? AND state = 'active'
-                 AND expires_at > ?""",
-            (now, chat_id, user_id, message_id, now),
-        )
-        if cursor.rowcount != 1:
-            return None
-        row = db.execute(
-            """SELECT chat_id, user_id, message_id, attempt, state,
-                      created_at, updated_at, expires_at, next_action_at
-               FROM captcha_challenges
-               WHERE chat_id = ? AND user_id = ?""",
-            (chat_id, user_id),
-        ).fetchone()
-    keys = (
-        "chat_id", "user_id", "message_id", "attempt",
-        "state", "created_at", "updated_at", "expires_at",
-        "next_action_at",
-    )
-    return dict(zip(keys, row))
+    allowed = None if allowed_chat_ids is None else set(allowed_chat_ids)
+    due = []
+    for key, row in sorted(
+        list(_challenges.items()), key=lambda pair: pair[1].get("next_action_at") or 0
+    ):
+        if row.get("state") not in {"queued", "waiting"}:
+            continue
+        if row.get("next_action_at") is None or row["next_action_at"] > now:
+            continue
+        if allowed is not None and key[0] not in allowed:
+            continue
+        row.update(state="dispatching", updated_at=now)
+        due.append(_snapshot(row))
+        if len(due) >= 100:
+            break
+    return due
 
 
-def claim_expired(chat_id: int, user_id: int, message_id: int) -> Optional[dict]:
+def due_expired(allowed_chat_ids: Optional[set[int]] = None) -> list[dict]:
     now = time.time()
-    with connect() as db:
-        cursor = db.execute(
-            """UPDATE captcha_challenges
-               SET state = 'processing', updated_at = ?
-               WHERE chat_id = ? AND user_id = ?
-                 AND message_id = ? AND state = 'active'
-                 AND expires_at <= ?""",
-            (now, chat_id, user_id, message_id, now),
-        )
-        if cursor.rowcount != 1:
-            return None
-        row = db.execute(
-            """SELECT chat_id, user_id, message_id, attempt, state,
-                      created_at, updated_at, expires_at, next_action_at
-               FROM captcha_challenges
-               WHERE chat_id = ? AND user_id = ?""",
-            (chat_id, user_id),
-        ).fetchone()
-    keys = (
-        "chat_id", "user_id", "message_id", "attempt",
-        "state", "created_at", "updated_at", "expires_at",
-        "next_action_at",
-    )
-    return dict(zip(keys, row))
+    allowed = None if allowed_chat_ids is None else set(allowed_chat_ids)
+    due = []
+    for key, row in list(_challenges.items()):
+        if row.get("state") != "active" or row.get("expires_at", 0) > now:
+            continue
+        if allowed is not None and key[0] not in allowed:
+            continue
+        row.update(state="timeout_processing", updated_at=now)
+        due.append(_snapshot(row))
+        if len(due) >= 100:
+            break
+    return due
 
 
-def claim_due_waiting() -> list[dict]:
+def claim_due_pending(allowed_chat_ids: Optional[set[int]] = None) -> list[dict]:
     now = time.time()
-    result = []
-    with connect() as db:
-        rows = list(
-            db.execute(
-                """SELECT chat_id, user_id, message_id, attempt, state,
-                          created_at, updated_at, expires_at, next_action_at
-                   FROM captcha_challenges
-                   WHERE state = 'waiting'
-                     AND next_action_at <= ?
-                   ORDER BY next_action_at
-                   LIMIT 100""",
-                (now,),
-            )
+    allowed = None if allowed_chat_ids is None else set(allowed_chat_ids)
+    due = []
+    for key, row in list(_challenges.items()):
+        state = row.get("state")
+        if state not in {"passed_pending", "kick_pending"}:
+            continue
+        if row.get("next_action_at") is not None and row["next_action_at"] > now:
+            continue
+        if allowed is not None and key[0] not in allowed:
+            continue
+        row.update(
+            state="passed_processing" if state == "passed_pending" else "kick_processing",
+            updated_at=now,
         )
-        for row in rows:
-            chat_id, user_id = row[0], row[1]
-            cursor = db.execute(
-                """UPDATE captcha_challenges
-                   SET state = 'processing', updated_at = ?
-                   WHERE chat_id = ? AND user_id = ? AND state = 'waiting'
-                     AND next_action_at <= ?""",
-                (now, chat_id, user_id, now),
-            )
-            if cursor.rowcount == 1:
-                keys = (
-                    "chat_id", "user_id", "message_id", "attempt",
-                    "state", "created_at", "updated_at", "expires_at",
-                    "next_action_at",
-                )
-                result.append(dict(zip(keys, row)))
-    return result
+        due.append(_snapshot(row))
+        if len(due) >= 100:
+            break
+    return due
 
 
-def due_expired() -> list[dict]:
+def claim_pending_for(chat_id: int, user_id: int, action: str) -> Optional[dict]:
+    expected_state, processing_state = {
+        "pass": ("passed_pending", "passed_processing"),
+        "kick": ("kick_pending", "kick_processing"),
+    }.get(action, (None, None))
+    if expected_state is None:
+        raise ValueError("Unsupported pending action")
+    row = _get_mutable(chat_id, user_id)
     now = time.time()
-    result = []
-    with connect() as db:
-        rows = list(
-            db.execute(
-                """SELECT chat_id, user_id, message_id, attempt, state,
-                          created_at, updated_at, expires_at, next_action_at
-                   FROM captcha_challenges
-                   WHERE state = 'active' AND expires_at <= ?
-                   ORDER BY expires_at
-                   LIMIT 100""",
-                (now,),
-            )
-        )
-        for row in rows:
-            chat_id, user_id, message_id = row[0], row[1], row[2]
-            cursor = db.execute(
-                """UPDATE captcha_challenges
-                   SET state = 'processing', updated_at = ?
-                   WHERE chat_id = ? AND user_id = ?
-                     AND message_id = ? AND state = 'active'
-                     AND expires_at <= ?""",
-                (now, chat_id, user_id, message_id, now),
-            )
-            if cursor.rowcount == 1:
-                keys = (
-                    "chat_id", "user_id", "message_id", "attempt",
-                    "state", "created_at", "updated_at", "expires_at",
-                    "next_action_at",
-                )
-                result.append(dict(zip(keys, row)))
-    return result
+    if not row or row.get("state") != expected_state:
+        return None
+    if row.get("next_action_at") is not None and row["next_action_at"] > now:
+        return None
+    row.update(state=processing_state, updated_at=now)
+    return _snapshot(row)
 
 
 def set_state(
@@ -262,30 +284,14 @@ def set_state(
     *,
     next_action_at: Optional[float] = None,
 ) -> None:
-    with connect() as db:
-        db.execute(
-            """UPDATE captcha_challenges
-               SET state = ?, updated_at = ?, next_action_at = ?
-               WHERE chat_id = ? AND user_id = ?""",
-            (state, time.time(), next_action_at, chat_id, user_id),
-        )
-
-
-
-def reactivate(
-    chat_id: int,
-    user_id: int,
-    timeout_seconds: int,
-) -> None:
+    row = _get_mutable(chat_id, user_id)
+    if row is None:
+        return
     now = time.time()
-    with connect() as db:
-        db.execute(
-            """UPDATE captcha_challenges
-               SET state = 'active', updated_at = ?, expires_at = ?,
-                   next_action_at = NULL
-               WHERE chat_id = ? AND user_id = ?""",
-            (now, now + timeout_seconds, chat_id, user_id),
-        )
+    if next_action_at is None and state in {"passed_pending", "kick_pending"}:
+        next_action_at = now
+    row.update(state=state, updated_at=now, next_action_at=next_action_at)
+
 
 def mark_waiting(
     chat_id: int,
@@ -293,37 +299,51 @@ def mark_waiting(
     attempt: int,
     delay_seconds: int,
 ) -> None:
-    with connect() as db:
-        db.execute(
-            """UPDATE captcha_challenges
-               SET state = 'waiting', attempt = ?, updated_at = ?,
-                   next_action_at = ?
-               WHERE chat_id = ? AND user_id = ?""",
-            (
-                attempt,
-                time.time(),
-                time.time() + delay_seconds,
-                chat_id,
-                user_id,
-            ),
-        )
+    row = _get_mutable(chat_id, user_id)
+    if row is None:
+        return
+    now = time.time()
+    row.update(
+        state="waiting",
+        attempt=int(attempt),
+        updated_at=now,
+        next_action_at=now + max(0, delay_seconds),
+        expected_value=None,
+        challenge_token=None,
+        expires_at=0.0,
+    )
+
+
+def mark_notice_sent(chat_id: int, user_id: int) -> None:
+    row = _get_mutable(chat_id, user_id)
+    if row:
+        row.update(notice_sent=True, updated_at=time.time())
+
+
+def retry_state(chat_id: int, user_id: int, state: str, delay_seconds: int = 30) -> None:
+    set_state(chat_id, user_id, state, next_action_at=time.time() + max(0, delay_seconds))
 
 
 def delete(chat_id: int, user_id: int) -> None:
-    with connect() as db:
-        db.execute(
-            "DELETE FROM captcha_challenges WHERE chat_id = ? AND user_id = ?",
-            (chat_id, user_id),
-        )
+    _challenges.pop(_key(chat_id, user_id), None)
 
 
-def reset_processing() -> None:
-    """Recover jobs left in processing after a process crash."""
+def recover_stale_states(stale_seconds: int = 300) -> None:
+    """Recover only in-process interrupted transitions; nothing survives restart."""
     now = time.time()
-    with connect() as db:
-        db.execute(
-            """UPDATE captcha_challenges
-               SET state = 'active', updated_at = ?
-               WHERE state = 'processing' AND updated_at < ?""",
-            (now, now - 120),
-        )
+    cutoff = now - max(0, stale_seconds)
+    for row in _challenges.values():
+        if row.get("updated_at", now) >= cutoff:
+            continue
+        state = row.get("state")
+        if state in {"processing", "timeout_processing"}:
+            row.update(state="active", updated_at=now, next_action_at=None)
+        elif state in {"preparing", "sending", "dispatching"}:
+            row.update(
+                state="queued", updated_at=now, next_action_at=now,
+                message_id=0, expected_value=None, challenge_token=None, expires_at=0.0,
+            )
+        elif state == "passed_processing":
+            row.update(state="passed_pending", updated_at=now, next_action_at=now)
+        elif state == "kick_processing":
+            row.update(state="kick_pending", updated_at=now, next_action_at=now)
