@@ -40,6 +40,10 @@ async def main():
     dp = Dispatcher()
     dp.include_routers(handlers.router)
 
+    # Validate permissions at startup, but do not crash the service solely
+    # because Telegram is temporarily unavailable. Runtime join handling retries.
+    await handlers.validate_configured_chat_rights(bot)
+
     try:
         await bot.set_my_commands(
             [
