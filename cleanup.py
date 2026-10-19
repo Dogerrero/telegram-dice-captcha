@@ -11,6 +11,7 @@ from utils import telegram_call
 
 RETRY_SECONDS = 60
 POLL_SECONDS = 5
+MAX_DELETE_RETRIES = 10
 _pending_deletions: dict[tuple[int, int], dict] = {}
 
 
@@ -79,7 +80,18 @@ def _retry_later(chat_id: int, message_id: int, failures: int) -> None:
     key = (chat_id, message_id)
     if key not in _pending_deletions:
         return
+    next_failures = failures + 1
+    if next_failures >= MAX_DELETE_RETRIES:
+        _pending_deletions.pop(key, None)
+        logging.error(
+            "Giving up deleting bot message chat=%s message=%s after %s failed attempts. "
+            "Check bot Delete messages permission and chat configuration.",
+            chat_id,
+            message_id,
+            next_failures,
+        )
+        return
     _pending_deletions[key] = {
         "delete_at": time.time() + RETRY_SECONDS,
-        "failures": failures + 1,
+        "failures": next_failures,
     }

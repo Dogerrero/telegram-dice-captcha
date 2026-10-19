@@ -52,7 +52,8 @@ from utils import (
 )
 
 router = Router()
-_pending_greeting_edits: dict[tuple[int, int], int] = {}
+GREETING_EDIT_TIMEOUT_SECONDS = 300
+_pending_greeting_edits: dict[tuple[int, int], dict] = {}
 
 
 def _chat_is_allowed(chat_id: int) -> bool:
@@ -212,9 +213,32 @@ async def _process_waiting(bot: Bot, challenge: dict) -> None:
     attempt = challenge["attempt"]
 
     try:
-        member = await telegram_call(
-            lambda: bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        )
+        try:
+            member = await telegram_call(
+                lambda: bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+            )
+        except Exception:
+            # The join update already told us this was an ordinary member.
+            # If only getChatMember is failing transiently, do not abandon the
+            # join: try restricting directly, then keep retrying on any failure.
+            # Telegram itself will reject restrictions that are not applicable.
+            if challenge.get("observed_join_status") not in {"member", "restricted"}:
+                raise
+            logging.exception(
+                "Could not re-check newcomer status; attempting fail-closed restriction "
+                "chat=%s user=%s",
+                chat_id,
+                user_id,
+            )
+            await apply_captcha_restriction(
+                bot,
+                chat_id,
+                user_id,
+                restrict=True,
+            )
+            await _send_challenge(bot, chat_id, user_id, attempt)
+            return
+
         status = _status(member)
         if status in {"left", "kicked"}:
             delete(chat_id, user_id)
@@ -334,11 +358,14 @@ async def _process_kick(bot: Bot, challenge: dict) -> None:
                 )
             )
         else:
-            # Save intent before the external side effect for restart recovery.
-            mark_kick_ban_issued(chat_id, user_id)
+            # Only mark the ban as issued after Telegram confirms success. If
+            # the response is ambiguous or the call fails, recovery must not
+            # unban a possible moderator-issued ban. The normal ban/unban flow
+            # is intentionally unchanged.
             await telegram_call(
                 lambda: bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
             )
+            mark_kick_ban_issued(chat_id, user_id)
             await telegram_call(
                 lambda: bot.unban_chat_member(
                     chat_id=chat_id, user_id=user_id, only_if_banned=True
@@ -352,6 +379,48 @@ async def _process_kick(bot: Bot, challenge: dict) -> None:
             chat_id,
         )
         retry_state(chat_id, user_id, "kick_pending", API_RETRY_DELAY)
+
+
+async def validate_configured_chat_rights(bot: Bot) -> None:
+    """Log setup errors for configured chats without preventing bot startup."""
+    for chat_id in sorted(allowed_chat_ids()):
+        try:
+            chat = await telegram_call(lambda chat_id=chat_id: bot.get_chat(chat_id))
+            if getattr(chat.type, "value", chat.type) != "supergroup":
+                logging.error(
+                    "Configured chat %s is not a supergroup (type=%s); CAPTCHA will be ignored",
+                    chat_id,
+                    getattr(chat.type, "value", chat.type),
+                )
+                continue
+            member = await telegram_call(
+                lambda chat_id=chat_id: bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
+            )
+            if _status(member) != "administrator":
+                logging.error(
+                    "Bot is not an administrator in configured chat %s; CAPTCHA cannot operate",
+                    chat_id,
+                )
+                continue
+            missing = []
+            if not bool(getattr(member, "can_restrict_members", False)):
+                missing.append("Restrict members")
+            if not bool(getattr(member, "can_delete_messages", False)):
+                missing.append("Delete messages")
+            if missing:
+                logging.error(
+                    "Bot is missing required admin rights in chat %s: %s",
+                    chat_id,
+                    ", ".join(missing),
+                )
+            else:
+                logging.info("Required bot rights verified in chat %s", chat_id)
+        except Exception:
+            logging.exception(
+                "Could not validate bot permissions for configured chat %s; "
+                "newcomer checks will retry when join events arrive",
+                chat_id,
+            )
 
 
 async def captcha_state_worker(bot: Bot) -> None:
@@ -408,24 +477,16 @@ async def new_member_handler(event: ChatMemberUpdated, bot: Bot):
         # Duplicate/replayed join updates must not reset a live challenge.
         return
 
-    try:
-        current_member = await telegram_call(
-            lambda: bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        )
-        current_status = _status(current_member)
-        if current_status in {"left", "kicked", "administrator", "creator"}:
-            logging.info(
-                "Skipping CAPTCHA because user is no longer an ordinary member chat=%s user=%s status=%s",
-                chat_id,
-                user_id,
-                current_status,
-            )
-            return
-    except Exception:
-        logging.exception(
-            "Could not inspect member before CAPTCHA chat=%s user=%s",
+    # The update itself is the first source of truth. Do not make CAPTCHA
+    # enrollment depend on an additional getChatMember request that can fail
+    # transiently and silently let a newcomer bypass the check.
+    observed_join_status = _status(event.new_chat_member)
+    if observed_join_status in {"administrator", "creator"}:
+        logging.info(
+            "Skipping CAPTCHA for joining administrator chat=%s user=%s status=%s",
             chat_id,
             user_id,
+            observed_join_status,
         )
         return
 
@@ -434,12 +495,14 @@ async def new_member_handler(event: ChatMemberUpdated, bot: Bot):
         chat_id,
         user_id,
         attempt=1,
-        delay_seconds=delay,
+        delay_seconds=API_RETRY_DELAY,
+        observed_join_status=observed_join_status,
     ):
         return
 
     # Lock immediately. If Telegram rejects this due to missing rights/network
-    # issues, the in-memory queue will retry it while the process is running.
+    # issues, the in-memory queue retries it while the process is running. The
+    # state is already queued, so no transient API error can lose the join event.
     try:
         await _ensure_bot_can_restrict(bot, chat_id)
         await apply_captcha_restriction(
@@ -450,7 +513,7 @@ async def new_member_handler(event: ChatMemberUpdated, bot: Bot):
         )
     except Exception:
         logging.exception(
-            "Could not restrict newcomer chat=%s user=%s; keeping durable retry",
+            "Could not restrict newcomer chat=%s user=%s; keeping in-memory retry",
             chat_id,
             user_id,
         )
@@ -536,14 +599,19 @@ async def greeting_settings_callback(callback: types.CallbackQuery, bot: Bot):
 
     action = (callback.data or "").split(":", 1)[1]
     if action == "edit":
-        _pending_greeting_edits[(chat_id, user_id)] = callback.message.message_id
         prompt = await bot.send_message(
             chat_id,
-            "Отправьте следующим сообщением новый текст приветствия (до 1000 символов).\n"
-            "Он будет добавляться перед вопросом капчи. Для отмены: /cancel_greeting",
+            "Ответьте именно на это сообщение новым текстом приветствия (до 1000 символов).\n"
+            f"Ожидание действует {GREETING_EDIT_TIMEOUT_SECONDS // 60} минут. "
+            "Для отмены: /cancel_greeting",
         )
         schedule_message_deletion(chat_id, prompt.message_id, MESSAGE_DELETE_TIMEOUT)
-        await callback.answer("Жду новый текст приветствия.")
+        _pending_greeting_edits[(chat_id, user_id)] = {
+            "menu_message_id": callback.message.message_id,
+            "prompt_message_id": prompt.message_id,
+            "expires_at": time.time() + GREETING_EDIT_TIMEOUT_SECONDS,
+        }
+        await callback.answer("Ответьте на сообщение бота новым приветствием.")
         return
 
     if action == "clear":
@@ -592,7 +660,27 @@ async def receive_greeting_text(message: types.Message, bot: Bot):
     key = (chat_id, user.id)
     if key not in _pending_greeting_edits:
         return
-    menu_message_id = _pending_greeting_edits[key]
+    pending = _pending_greeting_edits[key]
+    if time.time() >= pending["expires_at"]:
+        _pending_greeting_edits.pop(key, None)
+        if (
+            message.reply_to_message is not None
+            and message.reply_to_message.message_id == pending["prompt_message_id"]
+        ):
+            expired_notice = await message.reply(
+                "Время изменения приветствия истекло. Откройте /captcha_settings и начните заново."
+            )
+            schedule_message_deletion(chat_id, expired_notice.message_id, MESSAGE_DELETE_TIMEOUT)
+        return
+
+    # Do not consume ordinary administrator messages as configuration. Only a
+    # direct reply to the active bot prompt is accepted.
+    if (
+        message.reply_to_message is None
+        or message.reply_to_message.message_id != pending["prompt_message_id"]
+    ):
+        return
+
     if not _chat_is_allowed(chat_id) or not await _is_chat_admin(bot, chat_id, user.id):
         _pending_greeting_edits.pop(key, None)
         return
@@ -618,7 +706,7 @@ async def receive_greeting_text(message: types.Message, bot: Bot):
     try:
         await bot.edit_message_text(
             chat_id=chat_id,
-            message_id=menu_message_id,
+            message_id=pending["menu_message_id"],
             text=_settings_text(chat_id),
             parse_mode="HTML",
             reply_markup=_settings_keyboard(),

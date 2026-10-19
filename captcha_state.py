@@ -52,6 +52,7 @@ def queue_challenge(
     user_id: int,
     attempt: int = 1,
     delay_seconds: int = 0,
+    observed_join_status: Optional[str] = None,
 ) -> bool:
     """Start a transient flow for a new join; ignore duplicate join events."""
     key = _key(chat_id, user_id)
@@ -72,6 +73,9 @@ def queue_challenge(
         "challenge_token": None,
         "notice_sent": False,
         "kick_ban_issued": False,
+        # Status from the join update lets the worker fail closed if a later
+        # getChatMember call temporarily fails. It is not persisted to disk.
+        "observed_join_status": observed_join_status,
     }
     return True
 

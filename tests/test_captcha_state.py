@@ -36,6 +36,18 @@ class InMemoryCaptchaStateTests(unittest.TestCase):
             self.chat_id, self.user_id, message_id=999, attempt=attempt, timeout_seconds=120
         ))
 
+    def test_join_status_is_kept_for_fail_closed_api_retry(self):
+        self.assertTrue(
+            queue_challenge(
+                self.chat_id,
+                self.user_id,
+                observed_join_status="member",
+            )
+        )
+        self.assertEqual(
+            get(self.chat_id, self.user_id)["observed_join_status"], "member"
+        )
+
     def test_duplicate_join_does_not_reset_existing_flow(self):
         self.assertTrue(queue_challenge(self.chat_id, self.user_id))
         self.assertFalse(queue_challenge(self.chat_id, self.user_id))
