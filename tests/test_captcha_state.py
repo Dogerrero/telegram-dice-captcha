@@ -11,7 +11,9 @@ from captcha_state import (
     delete,
     due_expired,
     get,
+    pop_left_attempt,
     queue_challenge,
+    remember_left_attempt,
     resolve_active_answer,
     set_state,
     start_sending,
@@ -21,6 +23,7 @@ from captcha_state import (
 class InMemoryCaptchaStateTests(unittest.TestCase):
     def setUp(self):
         state._challenges.clear()
+        state._left_attempts.clear()
         self.chat_id = -100111
         self.user_id = 222
 
@@ -99,6 +102,22 @@ class InMemoryCaptchaStateTests(unittest.TestCase):
         queue_challenge(self.chat_id, self.user_id)
         delete(self.chat_id, self.user_id)
         self.assertIsNone(get(self.chat_id, self.user_id))
+
+    def test_rejoin_after_leaving_keeps_reached_attempt(self):
+        remember_left_attempt(self.chat_id, self.user_id, 2, ttl_seconds=1800)
+        self.assertEqual(pop_left_attempt(self.chat_id, self.user_id), 2)
+        # Consumed once: a second rejoin without a new leave starts fresh.
+        self.assertIsNone(pop_left_attempt(self.chat_id, self.user_id))
+
+    def test_left_attempt_expires(self):
+        remember_left_attempt(self.chat_id, self.user_id, 2, ttl_seconds=1800)
+        key = (self.chat_id, self.user_id)
+        state._left_attempts[key] = (2, time.time() - 1)
+        self.assertIsNone(pop_left_attempt(self.chat_id, self.user_id))
+
+    def test_left_attempt_not_kept_in_plain_kick_mode(self):
+        remember_left_attempt(self.chat_id, self.user_id, 2, ttl_seconds=0)
+        self.assertIsNone(pop_left_attempt(self.chat_id, self.user_id))
 
 
 if __name__ == "__main__":

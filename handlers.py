@@ -15,9 +15,12 @@ from constants import (
     CAPTCHA_TIMEOUT,
     CORRECT_ANSWER_MSG,
     DICE_SEND_MSG,
+    FAIL_BAN_SECONDS,
+    KICK_NOTICE_MSG,
     MAX_ACTIVE_CAPTCHAS_PER_CHAT,
     MAX_ATTEMPTS,
     MESSAGE_DELETE_TIMEOUT,
+    SECOND_WRONG_MSG,
     WRONG_ANSWER_MSG,
     WRONG_USER_MSG,
     allowed_chat_ids,
@@ -37,8 +40,10 @@ from captcha_state import (
     mark_notice_sent,
     mark_kick_ban_issued,
     mark_waiting,
+    pop_left_attempt,
     queue_challenge,
     recover_stale_states,
+    remember_left_attempt,
     retry_state,
     set_state,
     start_sending,
@@ -312,7 +317,7 @@ async def _process_kick(bot: Bot, challenge: dict) -> None:
                 notice = await telegram_call(
                     lambda: bot.send_message(
                         chat_id,
-                        f"Пользователь <a href=\"tg://user?id={user_id}\">не прошёл капчу</a> и будет исключён.",
+                        KICK_NOTICE_MSG.format(user_id=user_id),
                         parse_mode="HTML",
                     )
                 )
@@ -351,6 +356,10 @@ async def _process_kick(bot: Bot, challenge: dict) -> None:
                 )
                 delete(chat_id, user_id)
                 return
+            if FAIL_BAN_SECONDS:
+                # Our temporary ban is already in place; it expires by itself.
+                delete(chat_id, user_id)
+                return
             # Recovery after our ban succeeded but unban did not complete.
             await telegram_call(
                 lambda: bot.unban_chat_member(
@@ -360,17 +369,21 @@ async def _process_kick(bot: Bot, challenge: dict) -> None:
         else:
             # Only mark the ban as issued after Telegram confirms success. If
             # the response is ambiguous or the call fails, recovery must not
-            # unban a possible moderator-issued ban. The normal ban/unban flow
-            # is intentionally unchanged.
+            # unban a possible moderator-issued ban. With FAIL_BAN_SECONDS the
+            # ban is temporary and stays; with 0 it is a plain kick (ban + unban).
+            until_date = int(time.time()) + FAIL_BAN_SECONDS if FAIL_BAN_SECONDS else None
             await telegram_call(
-                lambda: bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
-            )
-            mark_kick_ban_issued(chat_id, user_id)
-            await telegram_call(
-                lambda: bot.unban_chat_member(
-                    chat_id=chat_id, user_id=user_id, only_if_banned=True
+                lambda: bot.ban_chat_member(
+                    chat_id=chat_id, user_id=user_id, until_date=until_date
                 )
             )
+            mark_kick_ban_issued(chat_id, user_id)
+            if not FAIL_BAN_SECONDS:
+                await telegram_call(
+                    lambda: bot.unban_chat_member(
+                        chat_id=chat_id, user_id=user_id, only_if_banned=True
+                    )
+                )
         delete(chat_id, user_id)
     except Exception:
         logging.exception(
@@ -452,6 +465,9 @@ async def member_left_handler(event: ChatMemberUpdated, bot: Bot):
         # Keep the durable kick job; a member-left event may actually be the ban
         # half of our ban/unban sequence after a previous process crash.
         return
+    if challenge and challenge["state"] not in {"passed_pending", "passed_processing"}:
+        # Leaving mid-CAPTCHA must not reset the attempts on rejoin.
+        remember_left_attempt(chat_id, user_id, challenge["attempt"], FAIL_BAN_SECONDS)
     delete(chat_id, user_id)
 
 
@@ -494,7 +510,7 @@ async def new_member_handler(event: ChatMemberUpdated, bot: Bot):
     if not queue_challenge(
         chat_id,
         user_id,
-        attempt=1,
+        attempt=pop_left_attempt(chat_id, user_id) or 1,
         delay_seconds=API_RETRY_DELAY,
         observed_join_status=observed_join_status,
     ):
@@ -786,9 +802,7 @@ async def captcha_answer_handler(callback: types.CallbackQuery, bot: Bot):
 
     if state == "kick_pending":
         try:
-            await callback.answer(
-                "Вторая попытка неверна. Вы будете исключены.", show_alert=True
-            )
+            await callback.answer(SECOND_WRONG_MSG, show_alert=True)
         except TelegramAPIError:
             pass
         pending = claim_pending_for(chat_id, user_id, "kick")

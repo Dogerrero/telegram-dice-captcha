@@ -12,6 +12,11 @@ from typing import Optional
 # member leaves. This deliberately is not a persistent user registry.
 _challenges: dict[tuple[int, int], dict] = {}
 
+# Attempt reached by members who left mid-CAPTCHA, keyed by (chat_id, user_id)
+# with an expiry. Without it, leaving and rejoining would reset the attempts
+# and sidestep the failure ban. Never written to disk.
+_left_attempts: dict[tuple[int, int], tuple[int, float]] = {}
+
 _ACTIVE_STATES = {
     "sending", "active", "processing", "dispatching", "timeout_processing"
 }
@@ -323,6 +328,24 @@ def retry_state(chat_id: int, user_id: int, state: str, delay_seconds: int = 30)
 
 def delete(chat_id: int, user_id: int) -> None:
     _challenges.pop(_key(chat_id, user_id), None)
+
+
+def remember_left_attempt(chat_id: int, user_id: int, attempt: int, ttl_seconds: int) -> None:
+    """Keep the attempt of a member who left mid-CAPTCHA for ttl_seconds."""
+    now = time.time()
+    for key, (_, expires_at) in list(_left_attempts.items()):
+        if expires_at <= now:
+            _left_attempts.pop(key, None)
+    if ttl_seconds > 0:
+        _left_attempts[_key(chat_id, user_id)] = (int(attempt), now + ttl_seconds)
+
+
+def pop_left_attempt(chat_id: int, user_id: int) -> Optional[int]:
+    """Return and forget the remembered attempt if it has not expired."""
+    entry = _left_attempts.pop(_key(chat_id, user_id), None)
+    if entry is None or entry[1] <= time.time():
+        return None
+    return entry[0]
 
 
 def recover_stale_states(stale_seconds: int = 300) -> None:

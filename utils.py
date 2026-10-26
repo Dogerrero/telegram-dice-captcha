@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Awaitable, Callable, TypeVar
 
 from aiogram import Bot, types
@@ -7,6 +8,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from captcha_payload import build_callback_data
+from constants import CAPTCHA_LOCK_SECONDS
 from permissions_policy import (
     CAPTCHA_LOCKED_PERMISSIONS,
     VERIFIED_MEMBER_PERMISSIONS,
@@ -60,14 +62,19 @@ async def apply_captcha_restriction(
     *,
     restrict: bool,
 ) -> None:
-    """Apply the temporary CAPTCHA lock or the explicit verified-member policy."""
+    """Apply the temporary CAPTCHA lock or the explicit verified-member policy.
+
+    The lock carries an expiry so that state lost on restart cannot keep the
+    member muted forever; the verified-member policy has none.
+    """
     permissions = locked_permissions() if restrict else verified_member_permissions()
+    until_date = int(time.time()) + CAPTCHA_LOCK_SECONDS if restrict else None
     await telegram_call(
         lambda: bot.restrict_chat_member(
             chat_id=chat_id,
             user_id=user_id,
             permissions=permissions,
-            until_date=None,
+            until_date=until_date,
             use_independent_chat_permissions=True,
         )
     )
