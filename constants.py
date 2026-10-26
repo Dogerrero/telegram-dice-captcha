@@ -26,8 +26,6 @@ if FAIL_BAN_SECONDS != 0 and not 60 <= FAIL_BAN_SECONDS <= 366 * 24 * 3600:
 # enrolled dynamically when the bot is added to them.
 def allowed_chat_ids() -> set[int]:
     raw = os.getenv("ALLOWED_CHAT_IDS", "").strip()
-    if not raw:
-        return set()
     result = set()
     for item in raw.split(","):
         item = item.strip()

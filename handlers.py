@@ -653,7 +653,8 @@ async def greeting_settings_callback(callback: types.CallbackQuery, bot: Bot):
     if action == "edit":
         prompt = await bot.send_message(
             chat_id,
-            "Ответьте именно на это сообщение новым текстом приветствия (до 1000 символов).\n"
+            "Отправьте следующим сообщением новый текст приветствия (до 1000 символов). "
+            "Можно ответить на это сообщение, но это необязательно.\n"
             f"Ожидание действует {GREETING_EDIT_TIMEOUT_SECONDS // 60} минут. "
             "Для отмены: /cancel_greeting",
         )
@@ -663,7 +664,7 @@ async def greeting_settings_callback(callback: types.CallbackQuery, bot: Bot):
             "prompt_message_id": prompt.message_id,
             "expires_at": time.time() + GREETING_EDIT_TIMEOUT_SECONDS,
         }
-        await callback.answer("Ответьте на сообщение бота новым приветствием.")
+        await callback.answer("Отправьте следующим сообщением новый текст приветствия.")
         return
 
     if action == "clear":
@@ -715,22 +716,10 @@ async def receive_greeting_text(message: types.Message, bot: Bot):
     pending = _pending_greeting_edits[key]
     if time.time() >= pending["expires_at"]:
         _pending_greeting_edits.pop(key, None)
-        if (
-            message.reply_to_message is not None
-            and message.reply_to_message.message_id == pending["prompt_message_id"]
-        ):
-            expired_notice = await message.reply(
-                "Время изменения приветствия истекло. Откройте /captcha_settings и начните заново."
-            )
-            schedule_message_deletion(chat_id, expired_notice.message_id, MESSAGE_DELETE_TIMEOUT)
-        return
-
-    # Do not consume ordinary administrator messages as configuration. Only a
-    # direct reply to the active bot prompt is accepted.
-    if (
-        message.reply_to_message is None
-        or message.reply_to_message.message_id != pending["prompt_message_id"]
-    ):
+        expired_notice = await message.reply(
+            "Время изменения приветствия истекло. Откройте /captcha_settings и начните заново."
+        )
+        schedule_message_deletion(chat_id, expired_notice.message_id, MESSAGE_DELETE_TIMEOUT)
         return
 
     if not _chat_is_allowed(chat_id) or not await _is_chat_admin(bot, chat_id, user.id):
