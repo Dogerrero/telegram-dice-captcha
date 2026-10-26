@@ -1,4 +1,4 @@
-"""Telegram dice CAPTCHA bot for explicitly configured supergroups."""
+"""Telegram dice CAPTCHA bot for supergroups where it is installed."""
 
 import asyncio
 import logging
@@ -21,12 +21,6 @@ import handlers
 API_TOKEN = os.getenv("API_TOKEN")
 if not API_TOKEN:
     raise RuntimeError("API_TOKEN is not configured")
-if not allowed_chat_ids():
-    raise RuntimeError(
-        "ALLOWED_CHAT_IDS is empty. Configure comma-separated Telegram supergroup IDs; "
-        "the bot deliberately refuses to moderate unspecified chats."
-    )
-
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -35,6 +29,9 @@ logging.basicConfig(
 
 async def main():
     handlers.initialize_state()
+
+    if not allowed_chat_ids():
+        logging.info("No groups enrolled yet; waiting for the bot to be added to a group")
 
     bot = Bot(token=API_TOKEN)
     dp = Dispatcher()

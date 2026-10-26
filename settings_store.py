@@ -1,4 +1,4 @@
-"""Persistent administrator text settings stored as JSON, never member records."""
+"""Persistent chat configuration stored as JSON, never member records."""
 
 import json
 import logging
@@ -20,7 +20,11 @@ def _read() -> dict:
         if not isinstance(data, dict):
             return {"greetings": {}}
         greetings = data.get("greetings", {})
-        return {"greetings": greetings if isinstance(greetings, dict) else {}}
+        data["greetings"] = greetings if isinstance(greetings, dict) else {}
+        if "allowed_chat_ids" in data:
+            chat_ids = data.get("allowed_chat_ids", [])
+            data["allowed_chat_ids"] = chat_ids if isinstance(chat_ids, list) else []
+        return data
     except FileNotFoundError:
         return {"greetings": {}}
     except (OSError, json.JSONDecodeError):
@@ -59,3 +63,46 @@ def clear_greeting(chat_id: int) -> None:
     data = _read()
     data["greetings"].pop(str(chat_id), None)
     _write(data)
+
+
+def get_allowed_chat_ids() -> set[int]:
+    result = set()
+    for value in _read().get("allowed_chat_ids", []):
+        try:
+            result.add(int(value))
+        except (TypeError, ValueError):
+            logging.warning("Ignoring invalid persisted chat ID %r", value)
+    return result
+
+
+def add_allowed_chat_id(chat_id: int) -> bool:
+    data = _read()
+    ids = {
+        int(value)
+        for value in data.get("allowed_chat_ids", [])
+        if str(value).lstrip("-").isdigit()
+    }
+    if chat_id in ids:
+        return False
+    ids.add(chat_id)
+    data["allowed_chat_ids"] = sorted(ids)
+    _write(data)
+    return True
+
+
+def remove_allowed_chat_id(chat_id: int) -> bool:
+    data = _read()
+    ids = {
+        int(value)
+        for value in data.get("allowed_chat_ids", [])
+        if str(value).lstrip("-").isdigit()
+    }
+    if chat_id not in ids:
+        return False
+    ids.remove(chat_id)
+    if ids:
+        data["allowed_chat_ids"] = sorted(ids)
+    else:
+        data.pop("allowed_chat_ids", None)
+    _write(data)
+    return True

@@ -1,4 +1,5 @@
 import os
+from settings_store import get_allowed_chat_ids as get_persisted_chat_ids
 
 CAPTCHA_ANSWER_PREFIX = "c:"
 BAN_TIMEOUT = int(os.getenv("BAN_TIMEOUT_SECONDS", "30"))
@@ -21,7 +22,8 @@ FAIL_BAN_SECONDS = int(os.getenv("FAIL_BAN_SECONDS", "1800"))
 if FAIL_BAN_SECONDS != 0 and not 60 <= FAIL_BAN_SECONDS <= 366 * 24 * 3600:
     raise RuntimeError("FAIL_BAN_SECONDS must be 0 or between 60 seconds and 366 days")
 
-# No chats are processed unless an explicit allow-list is configured.
+# A static allow-list may seed deployment configuration; groups can also be
+# enrolled dynamically when the bot is added to them.
 def allowed_chat_ids() -> set[int]:
     raw = os.getenv("ALLOWED_CHAT_IDS", "").strip()
     if not raw:
@@ -35,7 +37,7 @@ def allowed_chat_ids() -> set[int]:
             result.add(int(item))
         except ValueError:
             raise RuntimeError(f"Invalid chat ID in ALLOWED_CHAT_IDS: {item!r}")
-    return result
+    return result | get_persisted_chat_ids()
 
 
 # Texts

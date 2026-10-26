@@ -49,7 +49,13 @@ from captcha_state import (
     start_sending,
 )
 from rate_limit import allow_new_join
-from settings_store import clear_greeting, get_greeting, set_greeting
+from settings_store import (
+    add_allowed_chat_id,
+    clear_greeting,
+    get_greeting,
+    remove_allowed_chat_id,
+    set_greeting,
+)
 from utils import (
     apply_captcha_restriction,
     get_dice_keyboard,
@@ -434,6 +440,36 @@ async def validate_configured_chat_rights(bot: Bot) -> None:
                 "newcomer checks will retry when join events arrive",
                 chat_id,
             )
+
+
+@router.my_chat_member()
+async def bot_membership_handler(event: ChatMemberUpdated, bot: Bot):
+    """Persist groups that add the bot; stop processing after its removal."""
+    chat_id = event.chat.id
+    old_status = _status(event.old_chat_member)
+    new_status = _status(event.new_chat_member)
+
+    if event.chat.type != "supergroup":
+        logging.info("Ignoring bot membership change outside a supergroup chat=%s", chat_id)
+        return
+
+    if new_status in {"member", "administrator"}:
+        if add_allowed_chat_id(chat_id):
+            logging.info("Automatically allow-listed supergroup %s", chat_id)
+        if new_status != "administrator":
+            logging.warning(
+                "Bot is in supergroup %s but is not an administrator; CAPTCHA requires admin rights",
+                chat_id,
+            )
+        else:
+            try:
+                await _ensure_bot_can_restrict(bot, chat_id)
+            except Exception:
+                logging.exception("Bot lacks required moderation rights in supergroup %s", chat_id)
+        return
+
+    if old_status in {"member", "administrator"} and remove_allowed_chat_id(chat_id):
+        logging.info("Removed supergroup %s from the automatic allow-list", chat_id)
 
 
 async def captcha_state_worker(bot: Bot) -> None:
